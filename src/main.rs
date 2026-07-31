@@ -124,11 +124,37 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
         b.connect_clicked(move |_| view.execute_editing_command(cmd));
         fmt.append(&b);
     }
+    // Indent / outdent. In a list these are how you make and unmake SUB-LISTS, which is the only
+    // way to nest one -- there is no other gesture for it besides Tab, bound below.
+    for (icon, tip, cmd) in [
+        ("format-indent-less-symbolic", "Decrease indent  (Shift+Tab)", "Outdent"),
+        ("format-indent-more-symbolic", "Increase indent — makes a sub-list  (Tab)", "Indent"),
+    ] {
+        let b = tool(icon, tip);
+        let view = view.clone();
+        b.connect_clicked(move |_| view.execute_editing_command(cmd));
+        fmt.append(&b);
+    }
+    fmt.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+
+    for (icon, tip, cmd) in [
+        ("format-justify-left-symbolic", "Align left", "JustifyLeft"),
+        ("format-justify-center-symbolic", "Centre", "JustifyCenter"),
+        ("format-justify-right-symbolic", "Align right", "JustifyRight"),
+        ("format-justify-fill-symbolic", "Justify", "JustifyFull"),
+    ] {
+        let b = tool(icon, tip);
+        let view = view.clone();
+        b.connect_clicked(move |_| view.execute_editing_command(cmd));
+        fmt.append(&b);
+    }
     fmt.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
     // A page break is the one thing a CV genuinely needs and HTML has no key for. It goes in as a
     // styled empty div; the stylesheet turns it into `break-before: page`.
-    let brk = tool("format-justify-left-symbolic", "Insert page break");
+    // Icon: `go-bottom-symbolic` (push down to a bar). It was `format-justify-left-symbolic`, which
+    // was simply wrong -- that is the align-left glyph, and it now belongs to the button above.
+    let brk = tool("go-bottom-symbolic", "Insert page break  (Ctrl+Return)");
     {
         let view = view.clone();
         brk.connect_clicked(move |_| {
@@ -191,7 +217,7 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
                 Some(bytes) if doc::looks_like_html(&bytes) => {
                     let html = String::from_utf8_lossy(&bytes).to_string();
                     let title = doc::title_of(&html).unwrap_or_else(|| "Document".into());
-                    window.set_title(Some(&title));
+                    window.set_title(Some(&format!("{title} — Word")));
                     // base URI = the file's own directory, so relative <img src> resolves.
                     let base = path
                         .as_ref()
@@ -201,12 +227,12 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
                     state.borrow_mut().path = path;
                 }
                 Some(_) => {
-                    window.set_title(Some("Word"));
+                    window.set_title(Some("Untitled — Word"));
                     view.load_html(&doc::blank(setup), None);
                     state.borrow_mut().path = None;
                 }
                 None => {
-                    window.set_title(Some("Untitled"));
+                    window.set_title(Some("Untitled — Word"));
                     view.load_html(&doc::blank(setup), None);
                     state.borrow_mut().path = None;
                 }
@@ -237,7 +263,7 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
                         return;
                     }
                     if let Some(t) = doc::title_of(&html) {
-                        window.set_title(Some(&t));
+                        window.set_title(Some(&format!("{t} — Word")));
                     }
                     state.borrow_mut().path = Some(path);
                 },
@@ -296,9 +322,11 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
         });
     }
 
+    // New opens a NEW WINDOW. It used to reload the current view, which silently discarded whatever
+    // was on screen -- there is no autosave, so that was a data-loss button wearing a "new" label.
     {
-        let load_into = load_into.clone();
-        new_b.connect_clicked(move |_| load_into(None));
+        let app = app.clone();
+        new_b.connect_clicked(move |_| build(&app, None));
     }
 
     // --- page setup --------------------------------------------------------------------------------
@@ -321,6 +349,42 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
             op.set_page_setup(&state.borrow().setup.to_gtk());
             op.run_dialog(Some(&window));
         });
+    }
+
+    // --- keyboard ----------------------------------------------------------------------------------
+    // CAPTURE phase, so these beat the WebView. Only bindings WebKit does NOT already provide are
+    // added: it handles Ctrl+B/I/U, Ctrl+Z/Y and the clipboard itself, and binding those again here
+    // would fire the command twice and un-toggle it.
+    {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let view_k = view.clone();
+        let new_click = new_b.clone();
+        let open_click = open_b.clone();
+        let save_click = save_b.clone();
+        let print_click = print_b.clone();
+        let brk_click = brk.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            use gtk::gdk::Key;
+            match (ctrl, key) {
+                (true, Key::n) => new_click.emit_clicked(),
+                (true, Key::o) => open_click.emit_clicked(),
+                (true, Key::s) => save_click.emit_clicked(),
+                (true, Key::p) => print_click.emit_clicked(),
+                (true, Key::Return | Key::KP_Enter) => brk_click.emit_clicked(),
+                // Tab indents, Shift+Tab outdents. In a list this is how a sub-list is made, which
+                // is the behaviour every word processor has and the reason Tab does not insert a
+                // tab character here.
+                (false, Key::Tab) if !shift => view_k.execute_editing_command("Indent"),
+                (false, Key::ISO_Left_Tab) => view_k.execute_editing_command("Outdent"),
+                (false, Key::Tab) if shift => view_k.execute_editing_command("Outdent"),
+                _ => return glib::Propagation::Proceed,
+            }
+            glib::Propagation::Stop
+        });
+        window.add_controller(keys);
     }
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);

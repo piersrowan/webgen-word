@@ -27,8 +27,18 @@ pub fn stylesheet(setup: PageSetup) -> String {
               padding-bottom: 1.5mm; break-after: avoid; page-break-after: avoid; }}\n\
          h3 {{ font-size: 11.5pt; margin: 5mm 0 1mm; }}\n\
          p {{ margin: 0 0 3mm; }}\n\
-         ul, ol {{ margin: 0 0 3mm 6mm; padding: 0; }}\n\
+         /* Lists indent properly and nest visibly. The browser default (~4mm) is too tight to read\n\
+            as a list at print size, and nested levels were indistinguishable from their parent. */\n\
+         ul, ol {{ margin: 0 0 3mm 0; padding-left: 9mm; }}\n\
+         ul ul, ul ol, ol ul, ol ol {{ margin: 1mm 0 1mm 0; padding-left: 8mm; }}\n\
          li {{ margin: 0 0 1mm; }}\n\
+         /* Distinct markers per level, so a sub-list reads as one at a glance. */\n\
+         ul {{ list-style-type: disc; }}\n\
+         ul ul {{ list-style-type: circle; }}\n\
+         ul ul ul {{ list-style-type: square; }}\n\
+         ol {{ list-style-type: decimal; }}\n\
+         ol ol {{ list-style-type: lower-alpha; }}\n\
+         ol ol ol {{ list-style-type: lower-roman; }}\n\
          a {{ color: #1a5fb4; }}\n\
          img {{ max-width: 100%; }}\n\
          table {{ border-collapse: collapse; }}\n\
