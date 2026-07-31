@@ -32,6 +32,24 @@ struct State {
     /// Where it came from / goes back to. `None` until first save.
     path: Option<std::path::PathBuf>,
     setup: PageSetup,
+    /// The document's HTML as it stood at the last load or save, read back OUT OF THE DOM rather
+    /// than off disk. WebKit normalises markup on parse, so the file's own bytes are not a usable
+    /// baseline -- comparing against them would report "modified" on a document nobody touched.
+    /// This is what makes "close without saving?" ask only when there is something to lose.
+    baseline: String,
+}
+
+/// What goes in the title bar: the FILE NAME, not the document's `<title>`.
+///
+/// It used to be `<title>`, which meant a new document said "Untitled" forever -- saving it as
+/// `cv.html` changed nothing on screen, because the heading inside the file still said Untitled.
+/// Every word processor titles the window after the file; that is the thing you are looking for
+/// when you scan a taskbar.
+fn doc_title(path: &Option<std::path::PathBuf>) -> String {
+    match path {
+        Some(p) => p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".into()),
+        None => "Untitled".into(),
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -62,7 +80,11 @@ fn tool(icon: &str, tip: &str) -> gtk::Button {
 }
 
 fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
-    let state = Rc::new(RefCell::new(State { path: open.clone(), setup: PageSetup::default() }));
+    let state = Rc::new(RefCell::new(State {
+        path: open.clone(),
+        setup: PageSetup::default(),
+        baseline: String::new(),
+    }));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -81,9 +103,13 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
     let new_b = tool("document-new-symbolic", "New document");
     let open_b = tool("document-open-symbolic", "Open…");
     let save_b = tool("document-save-symbolic", "Save");
+    // Close the DOCUMENT, not the window: the window stays and gets a fresh blank one, so there is
+    // a way to put a file down without either quitting the app or leaving it open by accident.
+    let close_b = tool("window-close-symbolic", "Close document  (Ctrl+W)");
     header.pack_start(&new_b);
     header.pack_start(&open_b);
     header.pack_start(&save_b);
+    header.pack_start(&close_b);
 
     let setup_b = tool("document-properties-symbolic", "Page setup — paper size and margins");
     let print_b = tool("document-print-symbolic", "Print / export PDF");
@@ -216,29 +242,49 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
             match path.as_ref().and_then(|p| std::fs::read(p).ok()) {
                 Some(bytes) if doc::looks_like_html(&bytes) => {
                     let html = String::from_utf8_lossy(&bytes).to_string();
-                    let title = doc::title_of(&html).unwrap_or_else(|| "Document".into());
-                    window.set_title(Some(&format!("{title} — Word")));
                     // base URI = the file's own directory, so relative <img src> resolves.
                     let base = path
                         .as_ref()
                         .and_then(|p| p.parent())
                         .map(|d| format!("file://{}/", d.display()));
                     view.load_html(&html, base.as_deref());
+                    window.set_title(Some(&format!("{} — Word", doc_title(&path))));
                     state.borrow_mut().path = path;
                 }
-                Some(_) => {
-                    window.set_title(Some("Untitled — Word"));
+                // Either the file would not read, or it read but is not HTML. Both land on a blank
+                // document with no path, so a later Save cannot silently overwrite the file we
+                // declined to open.
+                _ => {
                     view.load_html(&doc::blank(setup), None);
-                    state.borrow_mut().path = None;
-                }
-                None => {
                     window.set_title(Some("Untitled — Word"));
-                    view.load_html(&doc::blank(setup), None);
                     state.borrow_mut().path = None;
                 }
             }
         })
     };
+    // Re-baseline whenever a document finishes loading. Registered BEFORE the first load so the
+    // initial document is baselined too -- `load_html` is asynchronous, the signal arrives later.
+    {
+        let state = state.clone();
+        view.connect_load_changed(move |v, ev| {
+            if ev != webkit6::LoadEvent::Finished {
+                return;
+            }
+            let state = state.clone();
+            v.evaluate_javascript(
+                "document.documentElement.outerHTML",
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    if let Ok(val) = res {
+                        state.borrow_mut().baseline = val.to_str().to_string();
+                    }
+                },
+            );
+        });
+    }
+
     load_into(open);
 
     // --- save -------------------------------------------------------------------------------------
@@ -262,10 +308,13 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
                         eprintln!("webgen-word: could not save {}: {e}", path.display());
                         return;
                     }
-                    if let Some(t) = doc::title_of(&html) {
-                        window.set_title(Some(&format!("{t} — Word")));
-                    }
-                    state.borrow_mut().path = Some(path);
+                    let path = Some(path);
+                    window.set_title(Some(&format!("{} — Word", doc_title(&path))));
+                    // Saved == not modified. Without this the very next Close would still claim
+                    // unsaved changes on a document that had just been written to disk.
+                    let mut s = state.borrow_mut();
+                    s.baseline = html.to_string();
+                    s.path = path;
                 },
             );
         })
@@ -329,6 +378,35 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
         new_b.connect_clicked(move |_| build(&app, None));
     }
 
+    // --- close ------------------------------------------------------------------------------------
+    // Close puts the FILE down and leaves the window open on a fresh blank document. Quitting to get
+    // rid of a file, or opening another one just to displace it, were the only ways to do this.
+    {
+        let load_into = load_into.clone();
+        let view = view.clone();
+        let window = window.clone();
+        let state = state.clone();
+        close_b.connect_clicked(move |_| {
+            let load_into = load_into.clone();
+            confirm_if_modified(&window, &view, &state, move || load_into(None));
+        });
+    }
+
+    // The window's X is the same data-loss risk by a different gesture, so it asks the same question.
+    // Returning Stop holds the window open while the dialog is up; the Close response closes it.
+    {
+        let view = view.clone();
+        let state = state.clone();
+        window.connect_close_request(move |w| {
+            if state.borrow().baseline.is_empty() {
+                return glib::Propagation::Proceed;
+            }
+            let w2 = w.clone();
+            confirm_if_modified(w, &view, &state, move || w2.destroy());
+            glib::Propagation::Stop
+        });
+    }
+
     // --- page setup --------------------------------------------------------------------------------
     {
         let state = state.clone();
@@ -363,6 +441,7 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
         let open_click = open_b.clone();
         let save_click = save_b.clone();
         let print_click = print_b.clone();
+        let close_click = close_b.clone();
         let brk_click = brk.clone();
         keys.connect_key_pressed(move |_, key, _, state| {
             let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
@@ -373,6 +452,7 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
                 (true, Key::o) => open_click.emit_clicked(),
                 (true, Key::s) => save_click.emit_clicked(),
                 (true, Key::p) => print_click.emit_clicked(),
+                (true, Key::w) => close_click.emit_clicked(),
                 (true, Key::Return | Key::KP_Enter) => brk_click.emit_clicked(),
                 // Tab indents, Shift+Tab outdents. In a list this is how a sub-list is made, which
                 // is the behaviour every word processor has and the reason Tab does not insert a
@@ -398,6 +478,64 @@ fn build(app: &adw::Application, open: Option<std::path::PathBuf>) {
     tv.set_content(Some(&content));
     window.set_content(Some(&tv));
     window.present();
+}
+
+/// Ask before throwing work away — and only when there is work to throw away.
+///
+/// "Modified" is decided by reading the live DOM and comparing it with the baseline captured at the
+/// last load or save. That is deliberate: an edit-then-undo leaves the document byte-identical to
+/// where it started, and a dialog that fires on a document you have not actually changed teaches
+/// people to dismiss it without reading, which is exactly when it stops protecting anything.
+///
+/// The answer is asynchronous (the DOM read is), so `proceed` runs from the callback rather than
+/// this function returning a verdict.
+fn confirm_if_modified<F: Fn() + 'static>(
+    window: &adw::ApplicationWindow,
+    view: &webkit6::WebView,
+    state: &Rc<RefCell<State>>,
+    proceed: F,
+) {
+    let window = window.clone();
+    let state = state.clone();
+    view.evaluate_javascript(
+        "document.documentElement.outerHTML",
+        None,
+        None,
+        gtk::gio::Cancellable::NONE,
+        move |res| {
+            let current = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+            // An empty baseline means the first load has not finished. Treat that as unmodified:
+            // there is nothing on screen to lose, and blocking on it would be a phantom prompt.
+            let unmodified = {
+                let s = state.borrow();
+                s.baseline.is_empty() || current == s.baseline
+            };
+            if unmodified {
+                proceed();
+                return;
+            }
+
+            let name = doc_title(&state.borrow().path);
+            let dlg = adw::MessageDialog::new(
+                Some(&window),
+                Some("Close without saving?"),
+                Some(&format!("“{name}” has changes that have not been saved. They will be lost.")),
+            );
+            dlg.add_response("cancel", "Cancel");
+            dlg.add_response("discard", "Close without saving");
+            dlg.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+            // Enter and Escape both land on Cancel: the safe answer is the one you get by reflex.
+            dlg.set_default_response(Some("cancel"));
+            dlg.set_close_response("cancel");
+            dlg.connect_response(None, move |dlg, resp| {
+                dlg.close();
+                if resp == "discard" {
+                    proceed();
+                }
+            });
+            dlg.present();
+        },
+    );
 }
 
 /// Paper size and the four margins. Applying rewrites the document's stylesheet so the on-screen

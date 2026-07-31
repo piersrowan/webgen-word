@@ -80,15 +80,6 @@ pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// Pull `<title>` out of a loaded file so the window can show a real name.
-pub fn title_of(html: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let s = lower.find("<title>")? + 7;
-    let e = lower[s..].find("</title>")? + s;
-    let t = html[s..e].trim();
-    (!t.is_empty()).then(|| t.to_string())
-}
-
 /// Is this file something we should open at all? Cheap, and only advisory -- the file chooser
 /// filters by extension, this catches "renamed a JPEG to .html".
 pub fn looks_like_html(bytes: &[u8]) -> bool {
