@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Word
+GenericName=Word Processor
+Comment=Write documents in HTML and print them to PDF
+Exec=webgen-word %U
+Icon=com.webgen.Word
+Terminal=false
+Categories=Office;WordProcessor;
+StartupNotify=true
+StartupWMClass=com.webgen.Word
+MimeType=text/html;application/xhtml+xml;

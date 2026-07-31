@@ -1,0 +1,49 @@
+[package]
+name = "webgen-word"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["webgen <piers.rowan@webgen.com.au>"]
+rust-version = "1.80"
+description = "webgen-word -- a light word processor whose document format is plain HTML"
+
+[[bin]]
+name = "webgen-word"
+path = "src/main.rs"
+
+# Same gtk4-rs line as the rest of the family, plus webkit6 0.4 -- the SAME versions the browser
+# uses, so both link one gtk4-sys and the OS builds one WebKit.
+#
+# WebKit is not an implementation detail here, it IS the product: `WebView::set_editable` supplies
+# the caret, selection, undo and clipboard behaviour that make this a text editor rather than a
+# toy. Writing that by hand over a text buffer is months of work and would still be worse.
+[dependencies]
+gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_4"] }
+webkit6 = "0.4"
+
+[profile.release]
+opt-level = 2
+strip = true
+
+[package.metadata.deb]
+name = "webgen-word"
+maintainer = "Piers Rowan <piers.rowan@webgen.com.au>"
+section = "editors"
+priority = "optional"
+depends = "$auto"
+maintainer-scripts = "packaging/deb-scripts"
+assets = [
+    ["target/release/webgen-word", "usr/bin/", "755"],
+    ["packaging/com.webgen.Word.desktop", "usr/share/applications/", "644"],
+    ["packaging/icons/hicolor/scalable/apps/com.webgen.Word.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["packaging/icons/hicolor/16x16/apps/com.webgen.Word.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["packaging/icons/hicolor/22x22/apps/com.webgen.Word.png", "usr/share/icons/hicolor/22x22/apps/", "644"],
+    ["packaging/icons/hicolor/24x24/apps/com.webgen.Word.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["packaging/icons/hicolor/32x32/apps/com.webgen.Word.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["packaging/icons/hicolor/48x48/apps/com.webgen.Word.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["packaging/icons/hicolor/64x64/apps/com.webgen.Word.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["packaging/icons/hicolor/128x128/apps/com.webgen.Word.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["packaging/icons/hicolor/256x256/apps/com.webgen.Word.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["packaging/icons/hicolor/512x512/apps/com.webgen.Word.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+]
