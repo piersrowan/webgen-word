@@ -96,6 +96,19 @@ pub fn prepare(html: &str, base_css: &str, setup: PageSetup) -> String {
     out
 }
 
+/// The contents of the per-document style block, and nothing else.
+///
+/// Parsing the *whole* document for style rules would be wrong in a way that is not obvious: the
+/// base stylesheet is one-rule-per-line too, so `p { margin: 0 0 3mm; }` from the house style would
+/// be read as a per-document override and then written into the document's own block the next time
+/// anything was applied. The block is addressed by id precisely so it can be read alone.
+pub fn custom_block(html: &str) -> String {
+    match style_block_span(html, docstyle::CUSTOM_STYLE_ID) {
+        Some(span) => html[span].to_string(),
+        None => String::new(),
+    }
+}
+
 /// The byte range of the *contents* of `<style id="…">`, if the document has one.
 fn style_block_span(html: &str, id: &str) -> Option<std::ops::Range<usize>> {
     let lower = html.to_ascii_lowercase();

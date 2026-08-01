@@ -37,9 +37,10 @@ mod js;
 mod page;
 mod sanitise;
 mod settings;
+mod sidebar;
 
 use adw::prelude::*;
-use docstyle::{Base, CustomStyles, TagStyle};
+use docstyle::{Base, CustomStyles};
 use gtk::glib;
 use page::{PageSetup, Paper};
 use settings::Settings;
@@ -51,19 +52,19 @@ use webkit6::prelude::*;
 const APP_ID: &str = settings::APP_ID;
 
 /// Everything the window needs to know about the open document.
-struct State {
+pub struct State {
     /// Where it came from / goes back to. `None` until first save.
-    path: Option<PathBuf>,
+    pub path: Option<PathBuf>,
     /// This document's page geometry — its own, read from its `<meta name="webgen-page">`, not the
     /// app's. Until 0.3.0 it was the app's, so opening a CV authored at A5 printed it at A4.
-    setup: PageSetup,
+    pub setup: PageSetup,
     /// The document's HTML as it stood at the last load or save, read back OUT OF THE DOM rather
     /// than off disk. WebKit normalises markup on parse, so the file's own bytes are not a usable
     /// baseline -- comparing against them would report "modified" on a document nobody touched.
     /// This is what makes "close without saving?" ask only when there is something to lose.
-    baseline: String,
+    pub baseline: String,
     /// This document's style overrides, as last read from or written to it.
-    custom: CustomStyles,
+    pub custom: CustomStyles,
 }
 
 /// What goes in the title bar: the FILE NAME, not the document's `<title>`.
@@ -176,11 +177,16 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     header.pack_start(&save_b);
 
     let print_b = tool("document-print-symbolic", "Print / export PDF  (Ctrl+P)");
+    let style_b = gtk::ToggleButton::new();
+    style_b.set_icon_name("applications-graphics-symbolic");
+    style_b.set_tooltip_text(Some("Style sidebar — click anything in the document to style it"));
+    style_b.add_css_class("flat");
     let menu_b = gtk::MenuButton::new();
     menu_b.set_icon_name("open-menu-symbolic");
     menu_b.set_tooltip_text(Some("Menu"));
     header.pack_end(&menu_b);
     header.pack_end(&print_b);
+    header.pack_end(&style_b);
 
     // --- formatting row ----------------------------------------------------------------------
     // `execute_editing_command` names are WebKit's own.
@@ -353,7 +359,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                 let mut s = state.borrow_mut();
                 s.path = path;
                 s.setup = setup;
-                s.custom = docstyle::parse_custom_css(&html);
+                s.custom = docstyle::parse_custom_css(&doc::custom_block(&html));
             }
             if let Some(summary) = report.summary() {
                 say(&summary);
@@ -372,6 +378,14 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             // The Picture menu needs to know which picture was clicked. WebKit's HitTestResult says
             // "an image" but not *which*, so the page marks the one the menu was opened on. This is
             // the app's own script, injected here — not script from the document, which is gone.
+            // The style sidebar's DOM half: helpers that remember and move the cursor.
+            v.evaluate_javascript(
+                &docstyle::cursor_script(),
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                |_| {},
+            );
             v.evaluate_javascript(
                 &format!(
                     "document.addEventListener('contextmenu', function (e) {{
@@ -426,8 +440,15 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             // record the page geometry so the file describes the shape it was written for.
             let script = format!(
                 "(function (title, page) {{
-                   document.querySelectorAll('.wg-selected').forEach(function (el) {{
+                   /* The editing-only markers must not reach the file -- but they must survive the
+                      save. Removing them outright was a real defect: after one Ctrl+S the style
+                      sidebar had no selected element any more and silently stopped responding. So
+                      they come off, the document is serialised, and they go straight back on. */
+                   const marked = Array.from(document.querySelectorAll('.wg-selected, .{cursor}'));
+                   const before = marked.map(function (el) {{ return el.getAttribute('class'); }});
+                   marked.forEach(function (el) {{
                      el.classList.remove('wg-selected');
+                     el.classList.remove('{cursor}');
                    }});
                    if (title && (!document.title || document.title === 'Untitled')) {{
                      document.title = title;
@@ -439,9 +460,12 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                      document.head.insertBefore(m, document.head.firstChild);
                    }}
                    m.setAttribute('content', page);
-                   return document.documentElement.outerHTML;
+                   const html = document.documentElement.outerHTML;
+                   marked.forEach(function (el, i) {{ el.setAttribute('class', before[i]); }});
+                   return html;
                  }})({title}, {page})",
                 meta = page::PAGE_META,
+                cursor = docstyle::CURSOR_CLASS,
                 title = js::string(&title),
                 page = js::string(&page_meta),
             );
@@ -632,6 +656,45 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         });
     }
 
+    // --- the style sidebar ------------------------------------------------------------------------
+    // Click anything in the document and the sidebar shows that element's style. The click is read
+    // as viewport coordinates and resolved with `elementFromPoint`, which is exact and works for
+    // pictures as well as text -- the caret alone would not tell us which picture was clicked.
+    let sidebar = sidebar::build(&view, &state, settings);
+    {
+        // Two measured facts shape this, and both look like the code is simply broken until you
+        // know them:
+        //
+        // 1. The gesture goes on the WINDOW, not on the WebView. A GestureClick added to the
+        //    WebView never fires in either phase -- WebKit's own event handling owns those events
+        //    outright. The window sees them, and translating back into the WebView's coordinate
+        //    space is what `elementFromPoint` wants anyway.
+        // 2. It is `pressed`, not `released`. WebKit claims the event sequence in the target phase,
+        //    which CANCELS this gesture before any release arrives; `pressed` fires first, while
+        //    the capture phase is still ours.
+        let sidebar_select = sidebar.select_at.clone();
+        let view = view.clone();
+        let clicks = gtk::GestureClick::new();
+        clicks.set_propagation_phase(gtk::PropagationPhase::Capture);
+        clicks.connect_pressed(move |_, _, x, y| {
+            let Some((vx, vy)) = window_to_view(&view, x, y) else { return };
+            sidebar_select(vx, vy);
+        });
+        window.add_controller(clicks);
+    }
+    {
+        let set_open = sidebar.set_open.clone();
+        style_b.connect_toggled(move |b| set_open(b.is_active()));
+    }
+    {
+        // Closing from inside the sidebar has to pop the header toggle back out.
+        let style_b = style_b.clone();
+        let is_open = sidebar.is_open.clone();
+        sidebar.root.connect_child_revealed_notify(move |_| {
+            style_b.set_active(is_open());
+        });
+    }
+
     // --- close -----------------------------------------------------------------------------------
     // Close puts the FILE down and leaves the window open on a fresh blank document. Quitting to get
     // rid of a file, or opening another one just to displace it, were the only ways to do this.
@@ -719,12 +782,9 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let settings = settings.clone();
         move || page_setup_dialog(&window, &view, &state, &settings)
     })));
-    style_section.append(Some("This document's style…"), Some(&action(&window, "document-style", {
-        let window = window.clone();
-        let view = view.clone();
-        let state = state.clone();
-        let settings = settings.clone();
-        move || document_style_dialog(&window, &view, &state, &settings)
+    style_section.append(Some("Style sidebar"), Some(&action(&window, "document-style", {
+        let set_open = sidebar.set_open.clone();
+        move || set_open(true)
     })));
     style_section.append(Some("Base style in Settings…"), Some(&action(&window, "base-style", {
         let say = say.clone();
@@ -789,14 +849,27 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     content.append(&banner);
     content.append(&fmt);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let scroller = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
-    content.append(&scroller);
+    let scroller = gtk::ScrolledWindow::builder().child(&view).vexpand(true).hexpand(true).build();
+    // The document and the style sidebar sit side by side; the sidebar slides in when it is opened.
+    let middle = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    middle.append(&scroller);
+    middle.append(&sidebar.root);
+    content.append(&middle);
 
     let tv = adw::ToolbarView::new();
     tv.add_top_bar(&header);
     tv.set_content(Some(&content));
     window.set_content(Some(&tv));
     window.present();
+}
+
+/// Translate a click on the window into the WebView's own coordinates, or `None` when it landed
+/// somewhere else — the toolbar, the sidebar, the header.
+fn window_to_view(view: &webkit6::WebView, x: f64, y: f64) -> Option<(f64, f64)> {
+    let root = view.root()?;
+    let (vx, vy) = root.translate_coordinates(view, x, y)?;
+    let inside = vx >= 0.0 && vy >= 0.0 && vx < view.width() as f64 && vy < view.height() as f64;
+    inside.then_some((vx, vy))
 }
 
 /// Give a path an `.html` extension when the user typed a bare name. Saving `cv` and getting a file
@@ -1087,360 +1160,4 @@ fn set_page_meta(view: &webkit6::WebView, setup: PageSetup) {
         page = js::string(&setup.to_meta()),
     );
     view.evaluate_javascript(&script, None, None, gtk::gio::Cancellable::NONE, |_| {});
-}
-
-/// This document's own style, on top of the base.
-///
-/// The base stylesheet is the house style; this panel writes a second block that overrides it per
-/// tag. Because [`docstyle`] emits that block in a fixed layout, the panel can read back whatever a
-/// document already carries — including one the browser's editor wrote — instead of starting blank.
-fn document_style_dialog(
-    window: &adw::ApplicationWindow,
-    view: &webkit6::WebView,
-    state: &Rc<RefCell<State>>,
-    settings: &Rc<Settings>,
-) {
-    let window = window.clone();
-    let view = view.clone();
-    let state = state.clone();
-    let settings = settings.clone();
-    // Read what the document actually has first, so the panel opens showing the truth.
-    docstyle::read_custom(&view.clone(), move |styles| {
-        state.borrow_mut().custom = styles;
-        show_document_style_dialog(&window, &view, &state, &settings);
-    });
-}
-
-fn show_document_style_dialog(
-    window: &adw::ApplicationWindow,
-    view: &webkit6::WebView,
-    state: &Rc<RefCell<State>>,
-    settings: &Rc<Settings>,
-) {
-    let dlg = adw::Window::builder()
-        .transient_for(window)
-        .modal(true)
-        .title("This document's style")
-        .default_width(460)
-        .default_height(620)
-        .build();
-
-    let group = adw::PreferencesGroup::new();
-    group.set_description(Some(
-        "Overrides the base style for this document only, and travels with the file.",
-    ));
-
-    let tag_row = adw::ComboRow::new();
-    tag_row.set_title("Element");
-    tag_row.set_model(Some(&gtk::StringList::new(docstyle::STYLEABLE_TAGS)));
-    group.add(&tag_row);
-
-    // The editable properties. Everything is a plain row bound to the tag currently selected above.
-    let font = gtk::FontDialogButton::new(Some(gtk::FontDialog::new()));
-    font.set_valign(gtk::Align::Center);
-    // Whether the picker has been used on the element now showing — see `collect` below.
-    let font_touched = Rc::new(std::cell::Cell::new(false));
-    // Set while the rows are being loaded, so filling them in does not count as a choice.
-    let loading = Rc::new(std::cell::Cell::new(false));
-    {
-        let (font_touched, loading) = (font_touched.clone(), loading.clone());
-        font.connect_font_desc_notify(move |_| {
-            if !loading.get() {
-                font_touched.set(true);
-            }
-        });
-    }
-    let font_row = adw::ActionRow::new();
-    font_row.set_title("Font");
-    font_row.set_subtitle("Family and size for this element");
-    font_row.add_suffix(&font);
-    group.add(&font_row);
-
-    let text_colour = ColourRow::new("Text colour", settings, "#1a1a1a");
-    group.add(&text_colour.row);
-    let background = ColourRow::new("Background", settings, "#ffffff");
-    group.add(&background.row);
-
-    let border = adw::EntryRow::new();
-    border.set_title("Border  (e.g. 1px solid #cccccc)");
-    group.add(&border);
-
-    let radius = adw::SpinRow::with_range(0.0, 60.0, 1.0);
-    radius.set_title("Corner radius (px)");
-    group.add(&radius);
-
-    let shadow = adw::SwitchRow::new();
-    shadow.set_title("Drop shadow");
-    group.add(&shadow);
-
-    let padding = adw::EntryRow::new();
-    padding.set_title("Padding  (e.g. 12px)");
-    group.add(&padding);
-
-    let margin = adw::EntryRow::new();
-    margin.set_title("Margin  (e.g. 6px)");
-    group.add(&margin);
-
-    const FLOATS: &[&str] = &["—", "left", "right", "none"];
-    let float = adw::ComboRow::new();
-    float.set_title("Float");
-    float.set_subtitle("Text wraps around the other side");
-    float.set_model(Some(&gtk::StringList::new(FLOATS)));
-    group.add(&float);
-
-    const ALIGNS: &[&str] = &["—", "left", "center", "right", "justify"];
-    let align = adw::ComboRow::new();
-    align.set_title("Text alignment");
-    align.set_model(Some(&gtk::StringList::new(ALIGNS)));
-    group.add(&align);
-
-    // --- moving values between the rows and the map ----------------------------------------------
-    let current_tag = {
-        let tag_row = tag_row.clone();
-        Rc::new(move || {
-            docstyle::STYLEABLE_TAGS
-                .get(tag_row.selected() as usize)
-                .copied()
-                .unwrap_or("p")
-                .to_string()
-        })
-    };
-
-    let load_rows: Rc<dyn Fn()> = {
-        let (state, current_tag) = (state.clone(), current_tag.clone());
-        let (font, border, radius, shadow, padding, margin, float, align) = (
-            font.clone(), border.clone(), radius.clone(), shadow.clone(),
-            padding.clone(), margin.clone(), float.clone(), align.clone(),
-        );
-        let (text_colour, background) = (text_colour.clone(), background.clone());
-        let (font_touched, loading) = (font_touched.clone(), loading.clone());
-        Rc::new(move || {
-            let tag = current_tag();
-            let style = state.borrow().custom.get(&tag).cloned().unwrap_or_default();
-            loading.set(true);
-            font_touched.set(!style.font_family.is_empty() || !style.font_size.is_empty());
-            let family = if style.font_family.is_empty() { "DejaVu Sans".to_string() } else { style.font_family.trim_matches('"').to_string() };
-            let size = style.font_size.trim_end_matches("pt").trim_end_matches("px").parse::<f64>().unwrap_or(11.0);
-            font.set_font_desc(&gtk::pango::FontDescription::from_string(&format!("{family} {size}")));
-            text_colour.set_hex(&style.colour);
-            background.set_hex(&style.background);
-            border.set_text(&style.border);
-            radius.set_value(style.radius.trim_end_matches("px").parse::<f64>().unwrap_or(0.0));
-            shadow.set_active(!style.shadow.is_empty());
-            padding.set_text(&style.padding);
-            margin.set_text(&style.margin);
-            float.set_selected(FLOATS.iter().position(|f| *f == style.float).unwrap_or(0) as u32);
-            align.set_selected(ALIGNS.iter().position(|a| *a == style.text_align).unwrap_or(0) as u32);
-            loading.set(false);
-        })
-    };
-
-    let collect: Rc<dyn Fn()> = {
-        let (state, current_tag) = (state.clone(), current_tag.clone());
-        let (font, border, radius, shadow, padding, margin, float, align) = (
-            font.clone(), border.clone(), radius.clone(), shadow.clone(),
-            padding.clone(), margin.clone(), float.clone(), align.clone(),
-        );
-        let (text_colour, background) = (text_colour.clone(), background.clone());
-        let font_touched = font_touched.clone();
-        Rc::new(move || {
-            let tag = current_tag();
-            let desc = font.font_desc();
-            let mut style = TagStyle {
-                font_family: desc
-                    .as_ref()
-                    .and_then(|d| d.family())
-                    .map(|f| format!("\"{f}\""))
-                    .unwrap_or_default(),
-                font_size: desc
-                    .as_ref()
-                    .filter(|d| d.size() > 0)
-                    .map(|d| format!("{}pt", d.size() / gtk::pango::SCALE))
-                    .unwrap_or_default(),
-                colour: text_colour.hex_or_empty(),
-                background: background.hex_or_empty(),
-                border: border.text().trim().to_string(),
-                radius: if radius.value() > 0.0 { format!("{}px", radius.value() as i64) } else { String::new() },
-                shadow: if shadow.is_active() { docstyle::HOUSE_SHADOW.to_string() } else { String::new() },
-                padding: padding.text().trim().to_string(),
-                margin: margin.text().trim().to_string(),
-                float: FLOATS.get(float.selected() as usize).copied().filter(|f| *f != "—").unwrap_or("").to_string(),
-                text_align: ALIGNS.get(align.selected() as usize).copied().filter(|a| *a != "—").unwrap_or("").to_string(),
-            };
-            // A font button always reports *something*, so an element the panel merely displayed
-            // would grow a rule saying "the font you already had". Only keep it once the picker has
-            // actually been used on this element.
-            if !font_touched.get() {
-                style.font_family.clear();
-                style.font_size.clear();
-            }
-            let mut s = state.borrow_mut();
-            if style.is_empty() {
-                s.custom.remove(&tag);
-            } else {
-                s.custom.insert(tag, style);
-            }
-        })
-    };
-
-    {
-        // Changing element collects the old one's values first, then loads the new one's.
-        let (collect, load_rows) = (collect.clone(), load_rows.clone());
-        let armed = Rc::new(std::cell::Cell::new(true));
-        let armed2 = armed.clone();
-        tag_row.connect_selected_notify(move |_| {
-            if !armed2.get() {
-                return;
-            }
-            collect();
-            armed2.set(false);
-            load_rows();
-            armed2.set(true);
-        });
-        let _ = armed;
-    }
-    load_rows();
-
-    let apply = gtk::Button::with_label("Apply");
-    apply.add_css_class("suggested-action");
-    let cancel = gtk::Button::with_label("Cancel");
-    {
-        let dlg = dlg.clone();
-        cancel.connect_clicked(move |_| dlg.close());
-    }
-    {
-        let dlg = dlg.clone();
-        let view = view.clone();
-        let state = state.clone();
-        let collect = collect.clone();
-        apply.connect_clicked(move |_| {
-            collect();
-            let css = docstyle::custom_css(&state.borrow().custom);
-            docstyle::inject_custom(&view, &css);
-            dlg.close();
-        });
-    }
-
-    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    buttons.set_halign(gtk::Align::End);
-    buttons.append(&cancel);
-    buttons.append(&apply);
-
-    let rows = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    rows.set_margin_top(16);
-    rows.set_margin_start(16);
-    rows.set_margin_end(16);
-    rows.append(&group);
-    // The rows scroll; Apply and Cancel do not. A panel with eleven rows is taller than the dialog,
-    // and buttons you have to scroll to find are buttons people do not find.
-    let scroller = gtk::ScrolledWindow::builder().child(&rows).vexpand(true).build();
-
-    buttons.set_margin_top(12);
-    buttons.set_margin_bottom(16);
-    buttons.set_margin_start(16);
-    buttons.set_margin_end(16);
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content.append(&scroller);
-    content.append(&buttons);
-
-    let tv = adw::ToolbarView::new();
-    tv.add_top_bar(&adw::HeaderBar::new());
-    tv.set_content(Some(&content));
-    dlg.set_content(Some(&tv));
-    dlg.present();
-}
-
-/// A colour row backed by the shared WebGen colour tool, so a colour chosen here is the same colour
-/// available in Paint, Edit and Swatch, and the saved palettes are the same palettes.
-///
-/// It draws its own chip rather than using `swatch_button`, for one reason: the panel has to be able
-/// to *set* the displayed colour when you switch element. `swatch_button` owns its own drawing and
-/// offers no way in, so switching from an element with red text to one with none would leave a red
-/// chip on a row that is not setting anything.
-#[derive(Clone)]
-struct ColourRow {
-    row: adw::ActionRow,
-    chip: gtk::DrawingArea,
-    value: Rc<std::cell::Cell<webgen_swatch::Rgb>>,
-    /// Whether this row is setting anything. An element the panel has not been used on must not
-    /// grow a colour rule just because a picker had to show *some* colour.
-    used: Rc<std::cell::Cell<bool>>,
-}
-
-impl ColourRow {
-    fn new(title: &str, settings: &Rc<Settings>, fallback: &str) -> ColourRow {
-        let initial =
-            webgen_swatch::Rgb::from_hex(fallback).unwrap_or(webgen_swatch::Rgb { r: 0, g: 0, b: 0 });
-        let value = Rc::new(std::cell::Cell::new(initial));
-        let used = Rc::new(std::cell::Cell::new(false));
-
-        let chip = gtk::DrawingArea::new();
-        chip.set_size_request(56, 22);
-        {
-            let value = value.clone();
-            let used = used.clone();
-            chip.set_draw_func(move |_, cr, w, h| {
-                webgen_swatch::paint_swatch(cr, w, h, value.get(), used.get(), false)
-            });
-        }
-
-        let button = gtk::Button::new();
-        button.set_child(Some(&chip));
-        button.set_valign(gtk::Align::Center);
-        button.set_tooltip_text(Some("Pick colour"));
-        {
-            let (value, used, chip) = (value.clone(), used.clone(), chip.clone());
-            let reg = settings.swatch_reg();
-            button.connect_clicked(move |btn| {
-                let (value, used, chip) = (value.clone(), used.clone(), chip.clone());
-                let popover = webgen_swatch::swatch_popover(&reg, btn, value.get(), move |rgb| {
-                    value.set(rgb);
-                    used.set(true);
-                    chip.queue_draw();
-                });
-                popover.popup();
-            });
-        }
-
-        let row = adw::ActionRow::new();
-        row.set_title(title);
-        row.add_suffix(&button);
-        row.set_activatable_widget(Some(&button));
-
-        // Clearing a colour is a thing people need: it puts the element back on the base style.
-        let clear = gtk::Button::from_icon_name("edit-clear-symbolic");
-        clear.set_valign(gtk::Align::Center);
-        clear.add_css_class("flat");
-        clear.set_tooltip_text(Some("Use the base style's colour"));
-        {
-            let (used, chip) = (used.clone(), chip.clone());
-            clear.connect_clicked(move |_| {
-                used.set(false);
-                chip.queue_draw();
-            });
-        }
-        row.add_suffix(&clear);
-
-        ColourRow { row, chip, value, used }
-    }
-
-    fn set_hex(&self, hex: &str) {
-        match webgen_swatch::Rgb::from_hex(hex) {
-            Some(rgb) => {
-                self.value.set(rgb);
-                self.used.set(true);
-            }
-            None => self.used.set(false),
-        }
-        self.chip.queue_draw();
-    }
-
-    fn hex_or_empty(&self) -> String {
-        if self.used.get() {
-            self.value.get().to_hex()
-        } else {
-            String::new()
-        }
-    }
 }

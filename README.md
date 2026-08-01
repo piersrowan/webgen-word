@@ -40,9 +40,10 @@ Two stylesheets, and the split is the point.
 - **Base** — `<style id="webgen-doc-style">`, generated from the shared registry and edited in
   **System Settings → Word**, rendered generically from `packaging/settings/com.webgen.Word.toml`
   (CONTRACT.md §2/§3). Word writes no GTK for that panel.
-- **This document's own** — `<style id="webgen-doc-custom">`, edited under *Menu → This document's
-  style*, written in a fixed layout so it reads back exactly as it was written, and carried **in the
-  file** so it survives being emailed.
+- **This document's own** — `<style id="webgen-doc-custom">`, edited in the **style sidebar**,
+  written in a fixed layout so it reads back exactly as it was written, and carried **in the file**
+  so it survives being emailed. It holds both `img { … }` rules (every picture) and `.wg-i1 { … }`
+  rules (one picture) — see below.
 
 The format — element ids, `wg-*` picture classes, styleable tags, property order — is **shared with
 the browser's editor** (CONTRACT.md §4c). A document styled in one opens correctly styled in the
@@ -57,7 +58,8 @@ other.
   alignments, remove-formatting, undo/redo.
 - **Pictures**: insert (embedded immediately), then right-click → *Picture* for align left / centre /
   right, wrap text left / right, and scale to 25 / 50 / 75 / 100%. Float, alignment and the rest of
-  what CSS can say about a picture are reachable per-document under *This document's style*.
+  what CSS can say about a picture are reachable in the style sidebar, for every picture or for
+  one.
 - **Insert page break** — the one thing a CV needs that HTML has no key for.
 - **Page setup**: paper size and all four margins, carried in the document and optionally saved as
   the default for new ones.
@@ -107,12 +109,20 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
 
 ## Verified
 
-- `cargo test` — 53 tests: the sanitiser (including a script containing markup, nested drops,
+- `cargo test` — 63 tests: the sanitiser (including a script containing markup, nested drops,
   idempotence, and that a clean document comes back byte for byte), the page-setup round trip
-  through the document meta, the style round trip through the fixed layout, and document
-  preparation.
+  through the document meta, the style round trip through the fixed layout including instance
+  rules, selector validation, and document preparation.
 - Driven under Xvfb + XTEST and screenshotted: opens a file, edits it, the window titles after the
   file name, Ctrl+S writes, the close-confirm names the document with Cancel as the default.
+- **The sidebar's whole scoping model, driven end to end.** Two pictures: border set to red in *All*
+  scope → both red, `img { border: 1px solid red; }` and no classes on either. Toggle to *This one*,
+  border green → one green and one red on screen, `.wg-i1 { border: 1px solid green; }` added and
+  `class="wg-i1"` on that picture alone. Toggle back to *All*, Apply → the `.wg-i1` rule is gone from
+  the file and the class is gone from the element. Reopening that document and clicking the
+  overridden picture opens on *This one* showing green; clicking the other opens on *All* showing red.
+- Tree navigation: `<SPAN>` → up → `<LI>` → up → `<UL>` → down → `<LI>` → down → `<SPAN>`, with the
+  arrows greying out at the ends.
 - **The doctype is written.** The 0.2.0 bug — `outerHTML` omits it, so every document Word saved
   opened in quirks mode in every browser — is fixed, covered by a test, and confirmed by a
   save-and-read-back run.
@@ -120,27 +130,58 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
   avoid` keeps job blocks whole, headings do not strand at a page foot.
 - `PageSetup` produces a true A4 MediaBox (210 × 297 mm), overriding GTK's Letter default.
 
+Found by that driving, and fixed: saving used to strip the sidebar's cursor class from the **live**
+DOM, so after one Ctrl+S the sidebar had no selected element and silently stopped responding. The
+markers now come off, the document is serialised, and they go straight back on.
+
 Not verified: on-screen editing on real WebGen hardware under labwc, the print dialog's "Print to
-File" flow end to end, and System Settings rendering the new `colour` rows. All need a screen — see
-the UAT queue.
+File" flow end to end, and System Settings rendering the `colour` rows. All need a screen — see the
+UAT queue.
 
-## Next tranche: the element style sidebar
+## The element style sidebar
 
-Piers, 2026-08-01. Clicking an object — a picture, a `div`, an `li`, a `ul` — opens a CSS editor in
-a **sidebar** rather than a modal. It is scoped to the element you clicked, and it navigates the
-document tree:
+Click anything in the document and the sidebar shows that element's style. The title is the resolved
+element — **`<LI>`** — and the arrows walk the tree: up to the parent, down to the first element
+child. Given `<ul><li><span>Test</span></li></ul>`, clicking the text resolves to `<span>`; up lands
+on `<li>`, up again on `<ul>`, down back to `<span>`.
 
-- the sidebar's title shows the resolved element, e.g. **`<LI>`**
-- an **up** arrow moves focus to the parent, so `<LI>` → `<UL>`
-- a **down** arrow moves focus to the first child, so `<LI>` → `<SPAN>`
+### All instances vs this instance
 
-Given `<ul><li><span>Test</span></li></ul>`, clicking the text resolves to `<li>`; up lands on
-`<ul>`, down on `<span>`.
+Every edit lands on one of two selectors, chosen with a toggle:
 
-One decision to settle before it is built: the per-document block is addressed **by tag**, so
-styling *one* element wants either a generated class per styled element or a move to inline styles.
-That is a format change affecting the browser too (CONTRACT.md §4c), so it deserves its own call
-rather than being settled by whoever writes the sidebar first.
+| Scope | Writes | Means |
+|---|---|---|
+| **All `<img>`** (default) | `img { border: 1px solid red; }` | every picture in the document |
+| **This one** | `.wg-i1 { border: 1px solid green; }` | that picture alone |
+
+So: click a picture, give it a red border — **all** pictures are red. Toggle to *This one*, change
+the border to green — that picture has a **one-line override** and the rest stay red. An instance
+rule beats the tag rule by CSS specificity, so the override is exactly the properties it names; the
+green picture keeps everything else the red rule gave it.
+
+The element gets a minted `wg-iN` class only if it has no `id` of its own to use as a handle.
+
+Two rules follow, and both are implemented:
+
+- **An element the document already styles specifically opens on "This one"** — a minted handle, or
+  an id or class of its own that some stylesheet actually targets.
+- **Toggling back to "All" shows the page-wide values, and Apply then deletes the element-specific
+  rule**, leaving the page-wide one to apply. The minted class comes off the element too, so dead
+  handles do not accumulate. An `id` is left alone — it is the document's own and may mean something
+  to somebody; only its rule in our block goes.
+
+**No inline styles.** Nothing writes a `style=""` attribute. Every edit is a rule in the document's
+`webgen-doc-custom` block, which is what keeps a document restyleable in one place.
+
+### Two measured facts about clicks on a WebView
+
+Both look like broken code until you know them, and both are in the comments:
+
+- A `GestureClick` added to the **WebView** never fires, in either propagation phase — WebKit's own
+  event handling owns those events outright. The gesture goes on the **window**, and the coordinates
+  are translated back into the WebView's space, which is what `elementFromPoint` wants anyway.
+- It must be `pressed`, not `released`. WebKit claims the event sequence in the target phase, which
+  **cancels** the gesture before any release arrives.
 
 ## Not done yet
 

@@ -503,6 +503,11 @@ fn render_tag(tag: &Tag, report: &mut Report) -> String {
             report.remote += 1;
             continue;
         }
+        // `class=""` is what removing the last class leaves behind — noise in a document, and it
+        // reaches the file every time an editing marker is stripped on the way out.
+        if name == "class" && value.trim().is_empty() {
+            continue;
+        }
         if URL_ATTRS.contains(&name.as_str()) && is_script_url(value) {
             report.scripts += 1;
             continue;
@@ -897,6 +902,13 @@ mod tests {
         let (out, r) = clean_str(doc);
         assert_eq!(out, doc);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn an_empty_class_attribute_is_dropped() {
+        // Removing the last class leaves `class=""`; it should not reach the saved file.
+        let (out, _) = clean_str(r#"<p class="">text</p><p class=" ">more</p><p class="real">keep</p>"#);
+        assert_eq!(out, r#"<p>text</p><p>more</p><p class="real">keep</p>"#);
     }
 
     #[test]

@@ -162,8 +162,10 @@ img {{
 .wg-wrap.wg-left  {{ float: left;  margin: 1mm 4mm 2mm 0; }}
 .wg-wrap.wg-right {{ float: right; margin: 1mm 0 2mm 4mm; }}
 .wg-clear {{ clear: both; }}
-/* The picture the Picture menu is aimed at. Editing only — stripped before saving. */
+/* The picture the Picture menu is aimed at, and the element the style sidebar is aimed at.
+   Editing only — both are stripped before saving. */
 .wg-selected {{ outline: 3px solid {link}; outline-offset: 3px; }}
+.wg-cursor {{ outline: 2px dashed {link}; outline-offset: 2px; }}
 /* Keep a block together across a page break where it would read badly split. */
 li, tr, h1, h2, h3 {{ break-inside: avoid; page-break-inside: avoid; }}
 /* Manual page breaks: invisible in print, a dashed rule while editing. */
@@ -197,7 +199,8 @@ li, tr, h1, h2, h3 {{ break-inside: avoid; page-break-inside: avoid; }}
 /// Tags the per-document panel can style, in the order it lists them. Shared with the browser.
 pub const STYLEABLE_TAGS: &[&str] = &[
     "h1", "h2", "h3", "h4", "h5", "h6", "p", "a", "ul", "ol", "li", "blockquote", "code", "pre",
-    "table", "td", "th", "img",
+    "table", "tr", "td", "th", "img", "figure", "figcaption", "hr", "div", "span", "section",
+    "article",
 ];
 
 /// The properties offered per tag. Kept deliberately short: this is document preparation, not a CSS
@@ -249,26 +252,103 @@ impl TagStyle {
     }
 }
 
-/// One document's overrides: tag → style. Ordered by [`STYLEABLE_TAGS`] on the way out.
+/// One document's overrides: **selector** → style.
+///
+/// Two kinds of key, and the distinction is the whole scoping model:
+///
+/// - a bare **tag** (`img`) — *all instances*. This is the default, and the common case: give
+///   pictures a red border and every picture in the document has one.
+/// - a **`.class`** or **`#id`** — *this instance*. One picture departs from the rule; it gets a
+///   single-line override of its own and every other picture stays as it was.
+///
+/// Instance rules beat tag rules by CSS specificity, not by ordering, so an override is exactly the
+/// properties it names — everything else still comes from the tag rule underneath it.
 pub type CustomStyles = HashMap<String, TagStyle>;
 
-/// Render the overrides in the fixed layout — one tag per line, properties in a fixed order.
+/// The class Word mints when an element needs a handle of its own and has no `id` to use.
+/// `wg-i1`, `wg-i2`, … — see [`next_instance_class`].
+pub const INSTANCE_CLASS_PREFIX: &str = "wg-i";
+
+/// Is `selector` one this format may carry? A styleable tag, or a single class or id.
+///
+/// Deliberately narrow. Descendant selectors, combinators and pseudo-classes are how a stylesheet
+/// becomes something you cannot reason about from a panel, and the panel is the only writer here.
+pub fn is_valid_selector(selector: &str) -> bool {
+    let s = selector.trim();
+    if STYLEABLE_TAGS.contains(&s) {
+        return true;
+    }
+    let Some(name) = s.strip_prefix('.').or_else(|| s.strip_prefix('#')) else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// True for the keys that style one element rather than every element of a kind.
+pub fn is_instance_selector(selector: &str) -> bool {
+    selector.starts_with('.') || selector.starts_with('#')
+}
+
+/// The lowest `wg-iN` class not already used, given the highest already seen in the document.
+pub fn next_instance_class(styles: &CustomStyles, seen_in_document: u32) -> String {
+    let highest_in_css = styles
+        .keys()
+        .filter_map(|k| k.strip_prefix(&format!(".{INSTANCE_CLASS_PREFIX}")))
+        .filter_map(|n| n.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("{INSTANCE_CLASS_PREFIX}{}", highest_in_document(highest_in_css, seen_in_document) + 1)
+}
+
+fn highest_in_document(a: u32, b: u32) -> u32 {
+    a.max(b)
+}
+
+/// Render the overrides in the fixed layout — one selector per line, properties in a fixed order.
+///
+/// Tag rules come first in [`STYLEABLE_TAGS`] order, then instance rules sorted by selector. The
+/// order is for the diff and for the round-trip tests; the cascade does not depend on it.
 pub fn custom_css(styles: &CustomStyles) -> String {
-    let mut out = String::from("/* webgen-doc-custom v1 — written by the document style panel */\n");
-    for tag in STYLEABLE_TAGS {
-        let Some(style) = styles.get(*tag) else { continue };
+    let mut out = String::from("/* webgen-doc-custom v2 — written by the document style panel */\n");
+    let rule = |selector: &str, style: &TagStyle| -> Option<String> {
         let declarations = style.declarations();
         if declarations.is_empty() {
-            continue;
+            return None;
         }
         let body = declarations
             .iter()
             .map(|(p, v)| format!("{p}: {v};"))
             .collect::<Vec<_>>()
             .join(" ");
-        out.push_str(&format!("{tag} {{ {body} }}\n"));
+        Some(format!("{selector} {{ {body} }}\n"))
+    };
+    for tag in STYLEABLE_TAGS {
+        if let Some(line) = styles.get(*tag).and_then(|s| rule(tag, s)) {
+            out.push_str(&line);
+        }
+    }
+    let mut instances: Vec<&String> = styles.keys().filter(|k| is_instance_selector(k)).collect();
+    instances.sort_by_key(|s| instance_sort_key(s));
+    for selector in instances {
+        if let Some(line) = styles.get(selector).and_then(|s| rule(selector, s)) {
+            out.push_str(&line);
+        }
     }
     out
+}
+
+/// `.wg-i10` must sort after `.wg-i9`, so the minted ones sort numerically and everything else
+/// falls in behind them alphabetically.
+fn instance_sort_key(selector: &str) -> (u8, u32, String) {
+    match selector
+        .strip_prefix(&format!(".{INSTANCE_CLASS_PREFIX}"))
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        Some(n) => (0, n, String::new()),
+        None => (1, 0, selector.to_string()),
+    }
 }
 
 /// Read the fixed layout back. Anything that is not our shape is ignored rather than guessed at.
@@ -281,7 +361,7 @@ pub fn parse_custom_css(css: &str) -> CustomStyles {
         }
         let Some((tag, rest)) = line.split_once('{') else { continue };
         let tag = tag.trim();
-        if !STYLEABLE_TAGS.contains(&tag) {
+        if !is_valid_selector(tag) {
             continue;
         }
         let Some(body) = rest.strip_suffix('}').map(str::trim) else { continue };
@@ -347,19 +427,197 @@ pub fn inject_custom(view: &WebView, css: &str) {
     inject_block(view, CUSTOM_STYLE_ID, css, false);
 }
 
-/// Read the per-document block back out, so the panel opens showing what the document actually has.
-pub fn read_custom<F: FnOnce(CustomStyles) + 'static>(view: &WebView, done: F) {
-    let script = format!(
+// ---- The element the sidebar is aimed at ---------------------------------
+//
+// The DOM half of the sidebar. The marker is a class rather than a Rust-side node handle because
+// WebKit gives us no node handles: everything crosses the boundary as a string, so the document
+// itself has to remember which element is selected between one call and the next.
+
+/// The class marking the element the sidebar is editing.
+pub const CURSOR_CLASS: &str = "wg-cursor";
+
+/// What the sidebar needs to know about the element under the cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selected {
+    /// Lowercase tag name, e.g. `li`.
+    pub tag: String,
+    /// The selector that addresses *this element alone*, if it already has one — a minted
+    /// `.wg-iN`, or its own `#id`. Empty when it has no handle yet; one is minted on Apply.
+    pub instance: String,
+    /// Whether the document already styles this element specifically. Piers' rule: an element with
+    /// classes or ids that pertain to its CSS opens on "this instance" rather than "all".
+    pub specific: bool,
+    pub has_parent: bool,
+    pub has_child: bool,
+    /// The highest `wg-iN` number in the document, so a minted class cannot collide with one whose
+    /// rule has since been deleted.
+    pub highest_instance: u32,
+}
+
+/// Records are `\u{1f}`-separated. Simple, unambiguous for the fields involved (none can contain a
+/// unit separator), and it keeps a JSON dependency out of a crate the OS has to vendor offline.
+const FS: char = '\u{1f}';
+
+impl Selected {
+    pub fn parse(record: &str) -> Option<Selected> {
+        let f: Vec<&str> = record.split(FS).collect();
+        if f.len() != 6 || f[0].is_empty() {
+            return None;
+        }
+        Some(Selected {
+            tag: f[0].to_string(),
+            instance: f[1].to_string(),
+            specific: f[2] == "1",
+            has_parent: f[3] == "1",
+            has_child: f[4] == "1",
+            highest_instance: f[5].parse().unwrap_or(0),
+        })
+    }
+}
+
+/// The shared JavaScript half: helpers the sidebar calls into. Injected once per load.
+///
+/// It lives as one string rather than five because every one of them needs `cursor()`, and a helper
+/// defined in one `evaluate_javascript` call is not in scope for the next.
+pub fn cursor_script() -> String {
+    format!(
+        "window.wgCursor = {{
+           el: function () {{ return document.querySelector('.{cursor}'); }},
+           clear: function () {{
+             document.querySelectorAll('.{cursor}').forEach(function (e) {{
+               e.classList.remove('{cursor}');
+             }});
+           }},
+           highest: function () {{
+             let max = 0;
+             document.querySelectorAll('[class]').forEach(function (e) {{
+               e.classList.forEach(function (c) {{
+                 const m = /^{prefix}(\\d+)$/.exec(c);
+                 if (m) max = Math.max(max, parseInt(m[1], 10));
+               }});
+             }});
+             return max;
+           }},
+           handle: function (el) {{
+             const own = Array.from(el.classList).find(function (c) {{
+               return /^{prefix}\\d+$/.test(c);
+             }});
+             if (own) return '.' + own;
+             if (el.id) return '#' + el.id;
+             return '';
+           }},
+           /* Piers' rule: an element the document already styles specifically opens on
+              'this instance'. That is true of a handle we minted, and of any id or class of its
+              own that some stylesheet actually targets. */
+           specific: function (el) {{
+             if (Array.from(el.classList).some(function (c) {{ return /^{prefix}\\d+$/.test(c); }})) {{
+               return true;
+             }}
+             const wanted = [];
+             if (el.id) wanted.push('#' + el.id);
+             el.classList.forEach(function (c) {{ if (!c.startsWith('wg-')) wanted.push('.' + c); }});
+             if (!wanted.length) return false;
+             for (const sheet of document.styleSheets) {{
+               let rules;
+               try {{ rules = sheet.cssRules; }} catch (e) {{ continue; }}
+               if (!rules) continue;
+               for (const rule of rules) {{
+                 if (!rule.selectorText) continue;
+                 const parts = rule.selectorText.split(',').map(function (s) {{ return s.trim(); }});
+                 if (wanted.some(function (w) {{ return parts.includes(w); }})) return true;
+               }}
+             }}
+             return false;
+           }},
+           describe: function () {{
+             const el = window.wgCursor.el();
+             if (!el) return '';
+             return [
+               el.tagName.toLowerCase(),
+               window.wgCursor.handle(el),
+               window.wgCursor.specific(el) ? '1' : '0',
+               (el.parentElement && el.parentElement !== document.documentElement) ? '1' : '0',
+               el.firstElementChild ? '1' : '0',
+               String(window.wgCursor.highest()),
+             ].join('{fs}');
+           }},
+         }};",
+        cursor = CURSOR_CLASS,
+        prefix = INSTANCE_CLASS_PREFIX,
+        fs = "\\u001f",
+    )
+}
+
+/// Put the cursor on whatever is at these viewport coordinates, and describe it.
+pub fn select_at_script(x: f64, y: f64) -> String {
+    format!(
+        "(function (x, y) {{
+           window.wgCursor.clear();
+           let el = document.elementFromPoint(x, y);
+           /* elementFromPoint misses when the click landed on a text node's whitespace; the
+              selection anchor is where the caret actually went. */
+           if (!el) {{
+             const sel = window.getSelection();
+             const node = sel && sel.anchorNode;
+             el = node ? (node.nodeType === 1 ? node : node.parentElement) : null;
+           }}
+           if (!el || el === document.documentElement || el.tagName === 'BODY') return '';
+           el.classList.add('{cursor}');
+           return window.wgCursor.describe();
+         }})({x}, {y})",
+        cursor = CURSOR_CLASS,
+    )
+}
+
+/// Move the cursor to the parent (`up`) or the first element child, and describe where it landed.
+pub fn move_cursor_script(up: bool) -> String {
+    format!(
         "(function () {{
-           const el = document.getElementById({});
-           return el ? el.textContent : '';
+           const el = window.wgCursor.el();
+           if (!el) return '';
+           const next = {step};
+           if (!next || next === document.documentElement || next.tagName === 'HTML') return '';
+           el.classList.remove('{cursor}');
+           next.classList.add('{cursor}');
+           return window.wgCursor.describe();
          }})()",
-        crate::js::string(CUSTOM_STYLE_ID)
-    );
-    view.evaluate_javascript(&script, None, None, gtk::gio::Cancellable::NONE, move |result| {
-        let css = result.map(|v| v.to_str().to_string()).unwrap_or_default();
-        done(parse_custom_css(&css));
-    });
+        step = if up { "el.parentElement" } else { "el.firstElementChild" },
+        cursor = CURSOR_CLASS,
+    )
+}
+
+/// Give the cursor element a handle of its own, minting `class` if it has none, and return the
+/// selector that addresses it.
+pub fn claim_instance_script(class: &str) -> String {
+    format!(
+        "(function (minted) {{
+           const el = window.wgCursor.el();
+           if (!el) return '';
+           const existing = window.wgCursor.handle(el);
+           if (existing) return existing;
+           el.classList.add(minted);
+           return '.' + minted;
+         }})({class})",
+        class = crate::js::string(class),
+    )
+}
+
+/// Take the minted handle back off the cursor element, for when it returns to the tag's rule.
+///
+/// Only ever removes classes *we* minted. An `id` is the document's own and might mean something to
+/// somebody, so it stays — only its rule in our block goes.
+pub fn release_instance_script() -> String {
+    format!(
+        "(function () {{
+           const el = window.wgCursor.el();
+           if (!el) return '';
+           Array.from(el.classList).forEach(function (c) {{
+             if (/^{prefix}\\d+$/.test(c)) el.classList.remove(c);
+           }});
+           return window.wgCursor.describe();
+         }})()",
+        prefix = INSTANCE_CLASS_PREFIX,
+    )
 }
 
 #[cfg(test)]
@@ -438,6 +696,111 @@ mod tests {
         let parsed = parse_custom_css("h2 { color: #445566; font-size: 1.4em; }");
         assert_eq!(parsed["h2"].colour, "#445566");
         assert!(parsed["h2"].float.is_empty() && parsed["h2"].text_align.is_empty());
+    }
+
+    // ---- scoping: all instances vs this instance --------------------------------------------
+
+    #[test]
+    fn an_instance_rule_overrides_the_tag_rule_without_replacing_it() {
+        // Piers' worked example: every picture gets a red border; one of them is then made green.
+        // The green rule must be a single line, and the red one must survive untouched.
+        let mut styles = CustomStyles::new();
+        styles.insert("img".into(), TagStyle { border: "1px solid #cc0000".into(), ..Default::default() });
+        styles.insert(".wg-i1".into(), TagStyle { border: "1px solid #00aa00".into(), ..Default::default() });
+        let css = custom_css(&styles);
+        assert!(css.contains("img { border: 1px solid #cc0000; }"), "{css}");
+        assert!(css.contains(".wg-i1 { border: 1px solid #00aa00; }"), "{css}");
+        // The override names only what it overrides — everything else still comes from `img`.
+        let instance_line = css.lines().find(|l| l.starts_with(".wg-i1")).unwrap();
+        assert_eq!(instance_line.matches(':').count(), 1, "one property only: {instance_line}");
+        assert_eq!(parse_custom_css(&css), styles);
+    }
+
+    #[test]
+    fn dropping_the_instance_rule_leaves_the_tag_rule_applying() {
+        // "on [Apply] the element specific CSS is deleted leaving the page wide CSS to apply"
+        let mut styles = CustomStyles::new();
+        styles.insert("img".into(), TagStyle { border: "1px solid #cc0000".into(), ..Default::default() });
+        styles.insert(".wg-i1".into(), TagStyle { border: "1px solid #00aa00".into(), ..Default::default() });
+        styles.remove(".wg-i1");
+        let css = custom_css(&styles);
+        assert!(css.contains("img { border: 1px solid #cc0000; }"), "{css}");
+        assert!(!css.contains("wg-i1"), "the override is gone entirely:\n{css}");
+    }
+
+    #[test]
+    fn ids_are_valid_instance_selectors_and_classes_are_too() {
+        assert!(is_valid_selector("img"));
+        assert!(is_valid_selector(".wg-i7"));
+        assert!(is_valid_selector("#logo"));
+        assert!(is_instance_selector("#logo") && is_instance_selector(".wg-i7"));
+        assert!(!is_instance_selector("img"));
+        // Anything that would make the block un-reasonable-about is refused.
+        assert!(!is_valid_selector("div > p"));
+        assert!(!is_valid_selector("a:hover"));
+        assert!(!is_valid_selector(".2cols"));
+        assert!(!is_valid_selector("."));
+        assert!(!is_valid_selector("marquee"));
+    }
+
+    #[test]
+    fn an_id_keyed_rule_round_trips() {
+        let mut styles = CustomStyles::new();
+        styles.insert("#logo".into(), TagStyle { float: "right".into(), ..Default::default() });
+        assert_eq!(parse_custom_css(&custom_css(&styles)), styles);
+    }
+
+    #[test]
+    fn tag_rules_come_before_instance_rules_and_mints_sort_numerically() {
+        let mut styles = CustomStyles::new();
+        for sel in [".wg-i10", ".wg-i9", "#logo", "img", "p"] {
+            styles.insert(sel.into(), TagStyle { float: "left".into(), ..Default::default() });
+        }
+        let css = custom_css(&styles);
+        let at = |s: &str| css.find(s).unwrap_or_else(|| panic!("{s} missing:\n{css}"));
+        assert!(at("p {") < at("img {"), "STYLEABLE_TAGS order");
+        assert!(at("img {") < at(".wg-i9"), "tags before instances");
+        assert!(at(".wg-i9") < at(".wg-i10"), "9 before 10, not lexicographic");
+        assert!(at(".wg-i10") < at("#logo"), "minted handles before other selectors");
+    }
+
+    #[test]
+    fn a_minted_class_never_collides_with_one_already_in_the_document() {
+        let mut styles = CustomStyles::new();
+        styles.insert(".wg-i3".into(), TagStyle::default());
+        // Nothing in the DOM: follow the CSS.
+        assert_eq!(next_instance_class(&styles, 0), "wg-i4");
+        // An element in the DOM carries a higher one whose rule was deleted — do not reuse it.
+        assert_eq!(next_instance_class(&styles, 7), "wg-i8");
+        assert_eq!(next_instance_class(&CustomStyles::new(), 0), "wg-i1");
+    }
+
+    #[test]
+    fn a_v1_block_still_loads_and_is_rewritten_as_v2() {
+        let v1 = "/* webgen-doc-custom v1 — written by the document style panel */\nh1 { color: #003366; }\n";
+        let parsed = parse_custom_css(v1);
+        assert_eq!(parsed["h1"].colour, "#003366");
+        assert!(custom_css(&parsed).contains("v2"));
+    }
+
+    #[test]
+    fn a_selected_element_record_round_trips() {
+        let record = "li\u{1f}.wg-i2\u{1f}1\u{1f}1\u{1f}0\u{1f}5";
+        let s = Selected::parse(record).expect("parses");
+        assert_eq!(s.tag, "li");
+        assert_eq!(s.instance, ".wg-i2");
+        assert!(s.specific && s.has_parent && !s.has_child);
+        assert_eq!(s.highest_instance, 5);
+        // An empty answer means "nothing is selected", not a default-shaped element.
+        assert!(Selected::parse("").is_none());
+        assert!(Selected::parse("li\u{1f}\u{1f}0").is_none());
+    }
+
+    #[test]
+    fn an_element_with_no_handle_yet_parses_as_having_none() {
+        let s = Selected::parse("p\u{1f}\u{1f}0\u{1f}1\u{1f}1\u{1f}0").expect("parses");
+        assert!(s.instance.is_empty());
+        assert!(!s.specific);
     }
 
     #[test]
