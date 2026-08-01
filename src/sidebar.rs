@@ -235,20 +235,10 @@ pub fn build(
     shadow.set_title("Drop shadow");
     group.add(&shadow);
 
-    let padding = adw::EntryRow::new();
-    padding.set_title("Padding");
-    padding.set_tooltip_text(Some("One value for all four sides, e.g. 12px"));
-    group.add(&padding);
-
-    let margin = adw::EntryRow::new();
-    margin.set_title("Margin");
-    margin.set_tooltip_text(Some("One value for all four sides, e.g. 6px"));
-    group.add(&margin);
-
-    let width = adw::EntryRow::new();
-    width.set_title("Width");
-    width.set_tooltip_text(Some("e.g. 100% or 12em"));
-    group.add(&width);
+    // Numbers with units, not free text -- see `stylerows::LengthRow` for why.
+    let padding = length_row("Padding", "One value for all four sides", &group);
+    let margin = length_row("Margin", "One value for all four sides", &group);
+    let width = length_row("Width", "0 leaves the width to the content", &group);
 
     let float = adw::ComboRow::new();
     float.set_title("Float");
@@ -376,9 +366,9 @@ pub fn build(
             }
             radius.set_value(style.radius.trim_end_matches("px").parse::<f64>().unwrap_or(0.0));
             shadow.set_active(!style.shadow.is_empty());
-            padding.set_text(&style.padding);
-            margin.set_text(&style.margin);
-            width.set_text(&style.width);
+            set_length(&padding, &style.padding);
+            set_length(&margin, &style.margin);
+            set_length(&width, &style.width);
             float.set_selected(FLOATS.iter().position(|f| *f == style.float).unwrap_or(0) as u32);
             align.set_selected(ALIGNS.iter().position(|a| *a == style.text_align).unwrap_or(0) as u32);
             ui.loading.set(false);
@@ -431,9 +421,9 @@ pub fn build(
                 ),
                 radius: if radius.value() > 0.0 { format!("{}px", radius.value() as i64) } else { String::new() },
                 shadow: if shadow.is_active() { docstyle::HOUSE_SHADOW.to_string() } else { String::new() },
-                padding: padding.text().trim().to_string(),
-                margin: margin.text().trim().to_string(),
-                width: width.text().trim().to_string(),
+                padding: get_length(&padding),
+                margin: get_length(&margin),
+                width: get_length(&width),
                 float: FLOATS.get(float.selected() as usize).copied().filter(|f| *f != "—").unwrap_or("").to_string(),
                 text_align: ALIGNS.get(align.selected() as usize).copied().filter(|a| *a != "—").unwrap_or("").to_string(),
             }
@@ -637,6 +627,35 @@ pub fn build(
     };
 
     Sidebar { root, select_at, set_open, is_open, refresh }
+}
+
+/// A number-and-unit row, matching `stylerows::LengthRow`. Returned as its two widgets because the
+/// sidebar's closures capture them separately.
+fn length_row(
+    title: &str,
+    subtitle: &str,
+    group: &adw::PreferencesGroup,
+) -> (adw::SpinRow, gtk::DropDown) {
+    let row = adw::SpinRow::with_range(0.0, 2000.0, 1.0);
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    let unit = gtk::DropDown::from_strings(docstyle::LENGTH_UNITS);
+    unit.set_valign(gtk::Align::Center);
+    unit.set_tooltip_text(Some("Unit"));
+    row.add_suffix(&unit);
+    group.add(&row);
+    (row, unit)
+}
+
+fn set_length(row: &(adw::SpinRow, gtk::DropDown), value: &str) {
+    let (number, unit) = docstyle::parse_length(value);
+    row.0.set_value(number);
+    row.1.set_selected(docstyle::LENGTH_UNITS.iter().position(|u| *u == unit).unwrap_or(0) as u32);
+}
+
+fn get_length(row: &(adw::SpinRow, gtk::DropDown)) -> String {
+    let unit = docstyle::LENGTH_UNITS.get(row.1.selected() as usize).copied().unwrap_or("px");
+    docstyle::compose_length(row.0.value(), unit)
 }
 
 /// The chosen value from a combo whose first entry is the "say nothing" dash.

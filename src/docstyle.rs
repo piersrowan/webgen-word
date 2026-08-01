@@ -117,13 +117,28 @@ pub fn base_css(base: &Base, setup: PageSetup) -> String {
    departures from it are in the {CUSTOM_STYLE_ID} block below. */
 @page {{ size: {paper}; margin: {t}mm {r}mm {b}mm {l}mm; }}
 html, body {{ margin: 0; padding: 0; }}
+/* On screen the body IS the sheet of paper: full paper width, the real margins as padding, white,
+   with a shadow, sitting on a grey desk. Before this the text simply hung in the middle of the
+   window with nothing to say where the page began or ended. In PRINT all of that comes off --
+   the geometry there comes from gtk::PageSetup, and a body with its own margins would apply them
+   twice. */
+html {{ background: #f0f0f0; }}
 body {{
   font: {pt}pt/{line} \"{family}\", \"DejaVu Sans\", sans-serif;
   color: {text};
   background: #ffffff;
-  max-width: {w}mm;
-  margin: 0 auto;
-  padding: 8mm 0;
+  max-width: {paper_w}mm;
+  min-height: {paper_h}mm;
+  margin: 8mm auto;
+  padding: {t}mm {r}mm {b}mm {l}mm;
+  box-sizing: border-box;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.14), 0 10px 28px rgba(0, 0, 0, 0.16);
+}}
+@media print {{
+  html {{ background: #ffffff; }}
+  body {{
+    max-width: none; min-height: 0; margin: 0; padding: 0; box-shadow: none;
+  }}
 }}
 h1, h2, h3, h4, h5, h6 {{ color: {heading}; }}
 h1 {{ font-size: 2em; margin: 0 0 2mm; letter-spacing: -0.02em; }}
@@ -147,7 +162,10 @@ a {{ color: {link}; }}
 blockquote {{ margin: 3mm 0; padding: 0 0 0 4mm; border-left: 2pt solid {link}; }}
 code, pre {{ font-family: ui-monospace, monospace; }}
 table {{ border-collapse: collapse; }}
-td, th {{ border: 0.6pt solid #999999; padding: 1.5mm 2.5mm; }}
+/* Deliberately NO border or padding on cells here. A table's appearance belongs to the table:
+   Word's tables carry their own scoped stylesheet in their block, and imposing a border from the
+   document sheet meant clearing a table's border did nothing visible -- the base rule showed
+   through and looked like the setting had been ignored. */
 img {{
   max-width: 100%; height: auto;
   border: {ib}px solid {ibc};
@@ -168,10 +186,16 @@ img {{
 .wg-cursor {{ outline: 2px dashed {link}; outline-offset: 2px; }}
 /* Keep a block together across a page break where it would read badly split. */
 li, tr, h1, h2, h3 {{ break-inside: avoid; page-break-inside: avoid; }}
-/* Manual page breaks: invisible in print, a dashed rule while editing. */
+/* Manual page breaks: invisible in print, and on screen a rule running the FULL width of the
+   sheet -- the negative margins cancel the body's padding -- so a break reads as the edge of a
+   page rather than as a line in the middle of the text. */
 .{brk}, .{legacy} {{ break-before: page; page-break-before: always; border: 0; height: 0; }}
 @media screen {{
-  .{brk}, .{legacy} {{ height: auto; margin: 6mm 0; border-top: 2px dashed {link}; }}
+  .{brk}, .{legacy} {{
+    height: auto;
+    margin: 6mm -{r}mm 6mm -{l}mm;
+    border-top: 1px dashed rgba(0, 0, 0, 0.35);
+  }}
 }}
 ",
         paper = setup.paper.css_size(),
@@ -185,7 +209,8 @@ li, tr, h1, h2, h3 {{ break-inside: avoid; page-break-inside: avoid; }}
         heading = base.heading,
         link = base.link,
         rule = base.rule,
-        w = setup.content_width_mm() as i64,
+        paper_w = setup.paper.width_mm() as i64,
+        paper_h = setup.paper.height_mm() as i64,
         ib = base.img_border_px,
         ibc = base.img_border_colour,
         ir = base.img_radius_px,
@@ -328,6 +353,47 @@ fn named_colour(name: &str) -> Option<String> {
         _ => return None,
     };
     Some(hex.to_string())
+}
+
+/// The units a length picker offers. `px` first because it is what most values are.
+pub const LENGTH_UNITS: &[&str] = &["px", "%", "em", "mm"];
+
+/// Build a length from a number and a unit. **0 writes nothing**, same rule as a border width: a
+/// zero-width thing is not a thing, and the declaration should not be there at all.
+pub fn compose_length(value: f64, unit: &str) -> String {
+    if value <= 0.0 {
+        return String::new();
+    }
+    let unit = if LENGTH_UNITS.contains(&unit) { unit } else { "px" };
+    if (value - value.round()).abs() < f64::EPSILON {
+        format!("{}{unit}", value.round() as i64)
+    } else {
+        format!("{value}{unit}")
+    }
+}
+
+/// Read a length back into a number and a unit.
+///
+/// A bare number is the case worth handling: `padding: 20` is not valid CSS and does nothing at
+/// all, which is exactly the trap a free-text box set for people. Here it is read as 20px, and the
+/// picker cannot produce a unitless value in the first place.
+///
+/// Only the FIRST value of a multi-value shorthand (`4px 8px`) is taken — the picker sets one value
+/// for all four sides by design, so round-tripping the shorthand would be a lie.
+pub fn parse_length(value: &str) -> (f64, String) {
+    let first = value.split_whitespace().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return (0.0, "px".to_string());
+    }
+    for unit in LENGTH_UNITS {
+        if let Some(n) = first.strip_suffix(unit).and_then(|n| n.parse::<f64>().ok()) {
+            return (n.max(0.0), unit.to_string());
+        }
+    }
+    match first.parse::<f64>() {
+        Ok(n) => (n.max(0.0), "px".to_string()),
+        Err(_) => (0.0, "px".to_string()),
+    }
 }
 
 /// One document's overrides: **selector** → style.
@@ -892,6 +958,33 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_number_is_read_as_pixels_rather_than_ignored() {
+        // `padding: 20` is not valid CSS and does nothing, which is what a free-text box invited.
+        assert_eq!(parse_length("20"), (20.0, "px".to_string()));
+        assert_eq!(parse_length("20px"), (20.0, "px".to_string()));
+        assert_eq!(parse_length("100%"), (100.0, "%".to_string()));
+        assert_eq!(parse_length("1.5em"), (1.5, "em".to_string()));
+        assert_eq!(parse_length(""), (0.0, "px".to_string()));
+        assert_eq!(parse_length("auto"), (0.0, "px".to_string()));
+    }
+
+    #[test]
+    fn a_zero_length_writes_no_declaration() {
+        assert_eq!(compose_length(0.0, "px"), "");
+        assert_eq!(compose_length(12.0, "px"), "12px");
+        assert_eq!(compose_length(100.0, "%"), "100%");
+        // Whole numbers do not grow a decimal point.
+        assert_eq!(compose_length(6.0, "mm"), "6mm");
+    }
+
+    #[test]
+    fn only_the_first_value_of_a_shorthand_is_taken() {
+        // The picker sets one value for all four sides, so pretending to round-trip `4px 8px`
+        // would be a lie.
+        assert_eq!(parse_length("4px 8px"), (4.0, "px".to_string()));
+    }
+
+    #[test]
     fn a_zero_width_border_writes_no_declaration_at_all() {
         // Piers' rule: "0px = remove all border code from that stanza of CSS".
         assert_eq!(compose_border(0, "solid", "#cc0000"), "");
@@ -977,7 +1070,13 @@ mod tests {
         let css = base_css(&base, setup);
         assert!(css.contains("size: A5;"), "{css}");
         assert!(css.contains("margin: 10mm 12mm 10mm 12mm;"), "{css}");
-        assert!(css.contains("max-width: 124mm"), "148 - 12 - 12:\n{css}");
+        // On screen the body is the SHEET, so its width is the paper's, and the margins are its
+        // padding. Print media takes all of that off again.
+        assert!(css.contains("max-width: 148mm"), "the paper width, not the text width:\n{css}");
+        assert!(css.contains("padding: 10mm 12mm 10mm 12mm;"), "{css}");
+        assert!(css.contains("box-shadow: 0 1px 3px"), "the page needs an edge:\n{css}");
+        assert!(css.contains("@media print"), "and none of it may reach the printer:\n{css}");
+        assert!(css.contains("margin: 6mm -12mm 6mm -12mm;"), "the break runs the full sheet:\n{css}");
         // Both page-break classes are styled, so 0.2-era documents still break.
         assert!(css.contains(PAGE_BREAK_CLASS) && css.contains(LEGACY_PAGE_BREAK_CLASS));
     }

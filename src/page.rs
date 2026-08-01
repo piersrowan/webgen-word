@@ -82,6 +82,16 @@ impl Paper {
         }
     }
 
+    /// Full paper height in millimetres, for drawing a page-shaped area on screen.
+    pub fn height_mm(self) -> f64 {
+        match self {
+            Paper::A4 => 297.0,
+            Paper::Letter => 279.4,
+            Paper::Legal => 355.6,
+            Paper::A5 => 210.0,
+        }
+    }
+
     /// Full paper width in millimetres.
     pub fn width_mm(self) -> f64 {
         match self {

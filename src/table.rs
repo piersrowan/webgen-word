@@ -150,7 +150,7 @@ impl Table {
         // left alone, so the document's own style still shows through.
         let cell = TagStyle {
             border: "1px solid #999999".into(),
-            padding: "4px 8px".into(),
+            padding: "6px".into(),
             ..TagStyle::default()
         };
         css.insert("th".to_string(), TagStyle { font_weight: "bold".into(), ..cell.clone() });

@@ -54,9 +54,9 @@ pub struct StyleRows {
     border_colour: ColourRow,
     radius: adw::SpinRow,
     shadow: adw::SwitchRow,
-    padding: adw::EntryRow,
-    margin: adw::EntryRow,
-    width: adw::EntryRow,
+    padding: LengthRow,
+    margin: LengthRow,
+    width: LengthRow,
     float: adw::ComboRow,
     align: adw::ComboRow,
 }
@@ -112,9 +112,12 @@ impl StyleRows {
         shadow.set_title("Drop shadow");
         group.add(&shadow);
 
-        let padding = entry("Padding", "One value for all four sides, e.g. 12px", &group);
-        let margin = entry("Margin", "One value for all four sides, e.g. 6px", &group);
-        let width = entry("Width", "e.g. 100% or 12em", &group);
+        // Numbers with units, not free text. A typed `20` is not valid CSS and does nothing at
+        // all, which is exactly what a text box invites; 0 clears the declaration, the same rule
+        // as the border width above.
+        let padding = LengthRow::new("Padding", "One value for all four sides", &group);
+        let margin = LengthRow::new("Margin", "One value for all four sides", &group);
+        let width = LengthRow::new("Width", "0 leaves the width to the content", &group);
 
         let float = combo("Float", FLOATS, &group);
         float.set_subtitle("Text wraps the other side");
@@ -172,9 +175,9 @@ impl StyleRows {
 
         self.radius.set_value(style.radius.trim_end_matches("px").parse::<f64>().unwrap_or(0.0));
         self.shadow.set_active(!style.shadow.is_empty());
-        self.padding.set_text(&style.padding);
-        self.margin.set_text(&style.margin);
-        self.width.set_text(&style.width);
+        self.padding.set(&style.padding);
+        self.margin.set(&style.margin);
+        self.width.set(&style.width);
         self.float.set_selected(index_of(FLOATS, &style.float));
         self.align.set_selected(index_of(ALIGNS, &style.text_align));
         self.loading.set(false);
@@ -220,9 +223,9 @@ impl StyleRows {
             } else {
                 String::new()
             },
-            padding: self.padding.text().trim().to_string(),
-            margin: self.margin.text().trim().to_string(),
-            width: self.width.text().trim().to_string(),
+            padding: self.padding.get(),
+            margin: self.margin.get(),
+            width: self.width.get(),
             float: pick(FLOATS, self.float.selected()),
             text_align: pick(ALIGNS, self.align.selected()),
         }
@@ -241,12 +244,44 @@ fn combo(title: &str, options: &[&str], group: &adw::PreferencesGroup) -> adw::C
     row
 }
 
-fn entry(title: &str, tip: &str, group: &adw::PreferencesGroup) -> adw::EntryRow {
-    let row = adw::EntryRow::new();
-    row.set_title(title);
-    row.set_tooltip_text(Some(tip));
-    group.add(&row);
-    row
+/// A CSS length: a number and a unit, never a free-text box.
+///
+/// The unit sits on the row as a dropdown rather than being typed, so a value cannot end up
+/// unitless — `padding: 20` is not valid CSS, does nothing, and looks exactly like the setting
+/// having been ignored. **0 clears the declaration**, the same rule as a border width.
+#[derive(Clone)]
+struct LengthRow {
+    row: adw::SpinRow,
+    unit: gtk::DropDown,
+}
+
+impl LengthRow {
+    fn new(title: &str, subtitle: &str, group: &adw::PreferencesGroup) -> LengthRow {
+        let row = adw::SpinRow::with_range(0.0, 2000.0, 1.0);
+        row.set_title(title);
+        row.set_subtitle(subtitle);
+        let unit = gtk::DropDown::from_strings(docstyle::LENGTH_UNITS);
+        unit.set_valign(gtk::Align::Center);
+        unit.set_tooltip_text(Some("Unit"));
+        row.add_suffix(&unit);
+        group.add(&row);
+        LengthRow { row, unit }
+    }
+
+    fn set(&self, value: &str) {
+        let (number, unit) = docstyle::parse_length(value);
+        self.row.set_value(number);
+        self.unit
+            .set_selected(docstyle::LENGTH_UNITS.iter().position(|u| *u == unit).unwrap_or(0) as u32);
+    }
+
+    fn get(&self) -> String {
+        let unit = docstyle::LENGTH_UNITS
+            .get(self.unit.selected() as usize)
+            .copied()
+            .unwrap_or("px");
+        docstyle::compose_length(self.row.value(), unit)
+    }
 }
 
 /// A colour row backed by the shared WebGen colour tool, so a colour chosen here is the same colour

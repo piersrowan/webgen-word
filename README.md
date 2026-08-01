@@ -219,6 +219,27 @@ Both look like broken code until you know them, and both are in the comments:
 - It must be `pressed`, not `released`. WebKit claims the event sequence in the target phase, which
   **cancels** the gesture before any release arrives.
 
+## The page on screen
+
+The body **is** the sheet: full paper width, the real margins as padding, white, with a shadow, on a
+grey desk. Before 0.7.0 the text simply hung in the middle of the window with nothing to say where
+the page began or ended. A manual page break draws a rule the **full width of the sheet**, so it
+reads as the edge of a page rather than a line in the middle of the text.
+
+None of it reaches the printer: `@media print` takes off the margins, the shadow and the width,
+because the printed geometry comes from `gtk::PageSetup` and a body with its own margins would apply
+them twice.
+
+## Lengths are numbers with units
+
+Padding, margin and width are a spinner plus a unit dropdown, not a text box. A typed `20` is not
+valid CSS, does nothing at all, and looks exactly like the setting having been ignored — the control
+now cannot produce a unitless value. **0 clears the declaration**, the same rule as a border width.
+
+An existing value written by hand still reads correctly: `20`, `20px`, `100%`, `1.5em` all land, and
+only the first value of a shorthand like `4px 8px` is taken, because the picker sets one value for
+all four sides and pretending otherwise would be a lie.
+
 ## Tables
 
 Tables are painful to get right, and the reason is that a table is the one genuinely
@@ -267,6 +288,10 @@ Three things there are load-bearing:
   `<script type="application/json">` because a word processor that strips script should not make
   exceptions to that.
 
+**The document stylesheet no longer puts borders on table cells.** It used to, which meant clearing
+a table's own border did nothing visible — the base rule showed through and looked like the setting
+had been ignored. A table's appearance belongs to its block.
+
 `border-collapse: collapse` is emitted for every table and is not a knob — a document table with
 separated borders looks like a mistake, and there is no reason to offer the mistake.
 
@@ -308,9 +333,27 @@ today because they were the same code an hour ago; they will drift. The sidebar 
 `StyleRows` — it is a mechanical change, and the two driving scripts that verify the sidebar make it
 cheap to check.
 
+## Headers, footers and page numbers — not implemented
+
+Asked directly, so answered directly: **they do not work in any form.** Two things stand in the way,
+both checked rather than assumed:
+
+- `webkit6::PrintOperation` exposes `page_setup`, `print_settings`, `print`, `run_dialog` and two
+  signals, and nothing else. There is no `draw-page` and no header/footer property — WebKit owns the
+  rendering and the app cannot draw on the printed page. `gtk::PrintOperation` *does* have
+  `connect_draw_page`, but WebKit builds its own internally and does not hand it over.
+- CSS `@page` margin boxes (`@top-center { content: counter(page) }`) are not implemented by WebKit,
+  which is consistent with the measured fact that `@page` is ignored on this print path entirely.
+
+The honest route is to **paginate in the app**: measure the content, slice it into page-sized
+sections, and emit the header, footer and number for each before printing. That is real work, but it
+is fully under our control and it is also what would give a true page count and a multi-page view on
+screen — which the new page metaphor makes conspicuous by its absence, since the sheet currently
+just grows rather than becoming a second page.
+
 ## Not done yet
 
-- Tables, find/replace, spell check, styles beyond the four.
+- Find/replace, spell check, styles beyond the four.
 - Any autosave. Save is explicit and there is no recovery file yet.
 - Word is not yet offered in Files' "Open With…". That list is `assoc::PROGRAMS`, a hardcoded const
   duplicated verbatim across `webgen-files` and `webgen-settings`, neither of which this session
