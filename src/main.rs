@@ -38,6 +38,7 @@ mod page;
 mod sanitise;
 mod settings;
 mod sidebar;
+mod undo;
 
 use adw::prelude::*;
 use docstyle::{Base, CustomStyles};
@@ -65,6 +66,10 @@ pub struct State {
     pub baseline: String,
     /// This document's style overrides, as last read from or written to it.
     pub custom: CustomStyles,
+    /// Style changes that can be taken back, oldest first. Interleaved with WebKit's own text
+    /// history by [`undo`], so Undo always reverses the last action whichever kind it was.
+    pub undo: Vec<undo::StyleStep>,
+    pub redo: Vec<undo::StyleStep>,
 }
 
 /// What goes in the title bar: the FILE NAME, not the document's `<title>`.
@@ -126,6 +131,8 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         setup: PageSetup::from_settings(settings),
         baseline: String::new(),
         custom: CustomStyles::new(),
+        undo: Vec::new(),
+        redo: Vec::new(),
     }));
 
     let window = adw::ApplicationWindow::builder()
@@ -274,15 +281,12 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     fmt.append(&clear);
     fmt.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
-    for (icon, tip, cmd) in [
-        ("edit-undo-symbolic", "Undo", "Undo"),
-        ("edit-redo-symbolic", "Redo", "Redo"),
-    ] {
-        let b = tool(icon, tip);
-        let view = view.clone();
-        b.connect_clicked(move |_| view.execute_editing_command(cmd));
-        fmt.append(&b);
-    }
+    // Undo and Redo go through `undo`, not straight to WebKit: a style change is an action too,
+    // and pressing Undo after one must take THAT back rather than the last thing that was typed.
+    let undo_b = tool("edit-undo-symbolic", "Undo  (Ctrl+Z)");
+    let redo_b = tool("edit-redo-symbolic", "Redo  (Ctrl+Shift+Z)");
+    fmt.append(&undo_b);
+    fmt.append(&redo_b);
 
     {
         let view = view.clone();
@@ -360,6 +364,9 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                 s.path = path;
                 s.setup = setup;
                 s.custom = docstyle::parse_custom_css(&doc::custom_block(&html));
+                // A different document is a different history.
+                s.undo.clear();
+                s.redo.clear();
             }
             if let Some(summary) = report.summary() {
                 say(&summary);
@@ -434,21 +441,42 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             let say = say.clone();
             let title = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             let page_meta = state.borrow().setup.to_meta();
+            // The instance selectors that still have a rule, space-delimited and padded so a
+            // substring test cannot match `.wg-i1` inside `.wg-i10`.
+            let live_handles = {
+                let s = state.borrow();
+                let mut list = String::from(" ");
+                for key in s.custom.keys().filter(|k| docstyle::is_instance_selector(k)) {
+                    list.push_str(key);
+                    list.push(' ');
+                }
+                list
+            };
             // Three fixups in the DOM before serialising: drop the editing-only outline class, give
             // the document a `<title>` matching its file name if it is still the placeholder (0.2.0
             // fixed the *window* title and left the document's own saying "Untitled" forever), and
             // record the page geometry so the file describes the shape it was written for.
             let script = format!(
-                "(function (title, page) {{
-                   /* The editing-only markers must not reach the file -- but they must survive the
-                      save. Removing them outright was a real defect: after one Ctrl+S the style
-                      sidebar had no selected element any more and silently stopped responding. So
-                      they come off, the document is serialised, and they go straight back on. */
-                   const marked = Array.from(document.querySelectorAll('.wg-selected, .{cursor}'));
-                   const before = marked.map(function (el) {{ return el.getAttribute('class'); }});
-                   marked.forEach(function (el) {{
-                     el.classList.remove('wg-selected');
-                     el.classList.remove('{cursor}');
+                "(function (title, page, live) {{
+                   /* Three kinds of class must not reach the file: the two editing markers, and
+                      any `wg-iN` handle no rule refers to any more. None of them may be removed
+                      from the LIVE document, though -- removing the markers outright was a real
+                      defect (after one Ctrl+S the style sidebar had no selected element and
+                      silently stopped responding), and removing a dead handle would make the
+                      style change that dropped its rule impossible to undo, because nothing could
+                      find the element again to put it back. So they come off, the document is
+                      serialised, and they all go straight back on. */
+                   const touched = [];
+                   document.querySelectorAll('[class]').forEach(function (el) {{
+                     const was = el.getAttribute('class');
+                     const kept = was.split(/\\s+/).filter(function (c) {{
+                       if (c === 'wg-selected' || c === '{cursor}') return false;
+                       if (/^wg-i\\d+$/.test(c)) return live.indexOf(' .' + c + ' ') !== -1;
+                       return c.length > 0;
+                     }}).join(' ');
+                     if (kept === was) return;
+                     touched.push([el, was]);
+                     if (kept) {{ el.setAttribute('class', kept); }} else {{ el.removeAttribute('class'); }}
                    }});
                    if (title && (!document.title || document.title === 'Untitled')) {{
                      document.title = title;
@@ -461,13 +489,14 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                    }}
                    m.setAttribute('content', page);
                    const html = document.documentElement.outerHTML;
-                   marked.forEach(function (el, i) {{ el.setAttribute('class', before[i]); }});
+                   touched.forEach(function (p) {{ p[0].setAttribute('class', p[1]); }});
                    return html;
-                 }})({title}, {page})",
+                 }})({title}, {page}, {live})",
                 meta = page::PAGE_META,
                 cursor = docstyle::CURSOR_CLASS,
                 title = js::string(&title),
                 page = js::string(&page_meta),
+                live = js::string(&live_handles),
             );
             view.evaluate_javascript(
                 &script,
@@ -686,6 +715,16 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let set_open = sidebar.set_open.clone();
         style_b.connect_toggled(move |b| set_open(b.is_active()));
     }
+    // Wired here rather than where the buttons are built, because undo has to be able to refresh
+    // the sidebar afterwards and the sidebar does not exist yet at that point.
+    {
+        let (view, state, refresh) = (view.clone(), state.clone(), sidebar.refresh.clone());
+        undo_b.connect_clicked(move |_| undo::undo(&view, &state, refresh.clone()));
+    }
+    {
+        let (view, state, refresh) = (view.clone(), state.clone(), sidebar.refresh.clone());
+        redo_b.connect_clicked(move |_| undo::redo(&view, &state, refresh.clone()));
+    }
     {
         // Closing from inside the sidebar has to pop the header toggle back out.
         let style_b = style_b.clone();
@@ -814,11 +853,19 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let save_as = save_as.clone();
         let close_document = close_document.clone();
         let brk_click = brk.clone();
+        let undo_click = undo_b.clone();
+        let undo_redo_b = redo_b.clone();
         keys.connect_key_pressed(move |_, key, _, modifier| {
             let ctrl = modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK);
             let shift = modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK);
             use gtk::gdk::Key;
             match (ctrl, shift, key) {
+                // Taken off WebKit deliberately. It handles Ctrl+Z and Ctrl+Shift+Z itself, and
+                // its stack knows nothing about style changes -- so these have to be intercepted
+                // here or the buttons and the keys would do different things.
+                (true, true, Key::Z | Key::z) => undo_redo_b.emit_clicked(),
+                (true, false, Key::z) => undo_click.emit_clicked(),
+                (true, false, Key::y) => undo_redo_b.emit_clicked(),
                 (true, true, Key::S | Key::s) => save_as(),
                 (true, false, Key::n) => new_click.emit_clicked(),
                 (true, false, Key::o) => open_click.emit_clicked(),

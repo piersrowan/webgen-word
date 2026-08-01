@@ -109,7 +109,7 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
 
 ## Verified
 
-- `cargo test` — 63 tests: the sanitiser (including a script containing markup, nested drops,
+- `cargo test` — 68 tests: the sanitiser (including a script containing markup, nested drops,
   idempotence, and that a clean document comes back byte for byte), the page-setup round trip
   through the document meta, the style round trip through the fixed layout including instance
   rules, selector validation, and document preparation.
@@ -123,6 +123,11 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
   overridden picture opens on *This one* showing green; clicking the other opens on *All* showing red.
 - Tree navigation: `<SPAN>` → up → `<LI>` → up → `<UL>` → down → `<LI>` → down → `<SPAN>`, with the
   arrows greying out at the ends.
+- **Piers' a1–a5 undo sequence, driven end to end.** Type into a four-paragraph document, make all
+  paragraphs bold, underline one of them, then Ctrl+Z twice: both style rules are gone from the file
+  and **the typed text is still there**. Ctrl+Y twice puts both rules back exactly. The sidebar's
+  rows follow — Underline reads "—" after the undo and "underline" after the redo, so the next Apply
+  cannot put back what was just undone.
 - **The doctype is written.** The 0.2.0 bug — `outerHTML` omits it, so every document Word saved
   opened in quirks mode in every browser — is fixed, covered by a test, and confirmed by a
   save-and-read-back run.
@@ -130,9 +135,13 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
   avoid` keeps job blocks whole, headings do not strand at a page foot.
 - `PageSetup` produces a true A4 MediaBox (210 × 297 mm), overriding GTK's Letter default.
 
-Found by that driving, and fixed: saving used to strip the sidebar's cursor class from the **live**
-DOM, so after one Ctrl+S the sidebar had no selected element and silently stopped responding. The
-markers now come off, the document is serialised, and they go straight back on.
+Found by that driving, and fixed: (1) saving used to strip the sidebar's cursor class from the
+**live** DOM, so after one Ctrl+S the sidebar had no selected element and silently stopped
+responding — the markers now come off, the document is serialised, and they go straight back on;
+(2) the content fingerprint moved when a handle was minted, because removing the class token left
+`class=""` behind on an element that had no class attribute before, so undo read it as a text edit
+and took back the wrong thing; (3) a save that referenced an unbound variable failed outright, which
+only the 0.3.0 "could not read the document back" banner made visible.
 
 Not verified: on-screen editing on real WebGen hardware under labwc, the print dialog's "Print to
 File" flow end to end, and System Settings rendering the `colour` rows. All need a screen — see the
@@ -173,6 +182,25 @@ Two rules follow, and both are implemented:
 **No inline styles.** Nothing writes a `style=""` attribute. Every edit is a rule in the document's
 `webgen-doc-custom` block, which is what keeps a document restyleable in one place.
 
+### Border: three pickers, and 0 removes it
+
+Width, style and colour, rather than a string to get wrong. **Width 0 writes no `border`
+declaration at all** — not `border: none` — so the rule is left clean, and a rule that had nothing
+else in it disappears entirely.
+
+A border written by hand or by another editor is read back into the three pickers by shape rather
+than by position, so `DOTTED 2px #abcdef` and `1px solid red` both land correctly; common CSS colour
+names are resolved to hex.
+
+### Properties
+
+Font, **weight**, **italic**, **underline**, text colour, background, border (width/style/colour),
+corner radius, drop shadow, padding, margin, float and text alignment.
+
+Weight, italic and underline are three-state — *say nothing*, `normal`, `bold` — rather than
+switches, because "say nothing" and "explicitly normal" are different answers: an explicit `normal`
+is how you take the bold off an element that inherits it.
+
 ### Two measured facts about clicks on a WebView
 
 Both look like broken code until you know them, and both are in the comments:
@@ -182,6 +210,36 @@ Both look like broken code until you know them, and both are in the comments:
   are translated back into the WebView's space, which is what `elementFromPoint` wants anyway.
 - It must be `pressed`, not `released`. WebKit claims the event sequence in the target phase, which
   **cancels** the gesture before any release arrives.
+
+## Undo covers the last action, whatever kind it was
+
+WebKit's undo stack knows about typing, pasting and the toolbar's editing commands. It knows nothing
+about a style change, because a style change is not an edit to the text — it rewrites the `<style>`
+block. So this sequence used to go wrong at the end:
+
+> a1 type "hello world" · a2 copy and paste it 3 times · a3 sidebar: all paragraphs bold ·
+> a4 pick one paragraph and underline it · **a5 undo × 2**
+
+Undo × 2 would have thrown away two of the *pastes* and left both style changes applied. It now
+takes back a4 and then a3, leaving the text exactly as it was typed.
+
+**How the two stacks stay in order.** There is no notification when WebKit records an undo step, so
+they cannot simply be merged. Each style step remembers a **fingerprint of the document's content**
+at the moment it was applied — a hash of the body with editing markers and `wg-iN` handles stripped
+out, so minting a handle does not read as an edit and only real content moves it. Undo then asks one
+question: has the content changed since the newest style step? No → take the style step back. Yes →
+something was typed since, so hand over to WebKit. Redo is the mirror image and invalidates itself
+for free: type after undoing a style change and the fingerprint no longer matches, so redo goes to
+WebKit instead.
+
+Ctrl+Z and Ctrl+Shift+Z (and Ctrl+Y) are intercepted rather than left to WebKit, or the keys and the
+toolbar buttons would do different things.
+
+**The one corner it does not cover:** text, then a style change, then more text, then undo held
+down. The text undoes newest-first as it should, but WebKit's stack runs on past the style boundary,
+so older text comes back before the style step does. The end state after undoing everything is the
+same; only the middle differs. When WebKit reports it has nothing left, style steps are taken
+regardless, so none is ever stranded.
 
 ## Not done yet
 

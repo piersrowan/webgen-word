@@ -209,6 +209,13 @@ pub const STYLEABLE_TAGS: &[&str] = &[
 pub struct TagStyle {
     pub font_family: String,
     pub font_size: String,  // e.g. "1.2em" or "18px"
+    /// `normal` | `bold`. Empty means "say nothing", which is not the same as `normal`: an explicit
+    /// `normal` is how you take the bold off something that inherits it.
+    pub font_weight: String,
+    /// `normal` | `italic`.
+    pub font_style: String,
+    /// `none` | `underline` | `line-through`.
+    pub text_decoration: String,
     pub colour: String,     // #rrggbb
     pub background: String, // #rrggbb
     pub border: String,     // e.g. "1px solid #cccccc"
@@ -234,6 +241,9 @@ impl TagStyle {
         for (prop, value) in [
             ("font-family", self.font_family.as_str()),
             ("font-size", self.font_size.as_str()),
+            ("font-weight", self.font_weight.as_str()),
+            ("font-style", self.font_style.as_str()),
+            ("text-decoration", self.text_decoration.as_str()),
             ("color", self.colour.as_str()),
             ("background", self.background.as_str()),
             ("border", self.border.as_str()),
@@ -250,6 +260,70 @@ impl TagStyle {
         }
         out
     }
+}
+
+/// Border styles offered by the picker. `none` is not among them: a border is removed by setting
+/// its **width to 0**, which drops the declaration from the rule entirely rather than writing
+/// `border: none` — Piers' rule, and the one that leaves the stanza clean.
+pub const BORDER_STYLES: &[&str] = &["solid", "dashed", "dotted", "double", "groove", "ridge"];
+
+/// Build a `border` declaration from the three pickers. **Width 0 means no declaration at all.**
+pub fn compose_border(width_px: i64, style: &str, colour: &str) -> String {
+    if width_px <= 0 {
+        return String::new();
+    }
+    let style = if BORDER_STYLES.contains(&style) { style } else { "solid" };
+    let colour = if colour.trim().is_empty() { "#000000" } else { colour.trim() };
+    format!("{width_px}px {style} {colour}")
+}
+
+/// Read a `border` declaration back into the three pickers: `(width, style, colour)`.
+///
+/// Tolerant of what a person or another editor may have written — the parts are recognised by shape
+/// and order does not matter. A width it cannot find is 0, which is the same as no border.
+pub fn parse_border(value: &str) -> (i64, String, String) {
+    let mut width = 0i64;
+    let mut style = "solid".to_string();
+    let mut colour = String::new();
+    for part in value.split_whitespace() {
+        let lower = part.to_ascii_lowercase();
+        if let Some(n) = lower.strip_suffix("px").and_then(|n| n.parse::<f64>().ok()) {
+            width = n.round() as i64;
+        } else if BORDER_STYLES.contains(&lower.as_str()) {
+            style = lower;
+        } else if lower == "none" || lower == "hidden" {
+            width = 0;
+        } else if !lower.is_empty() {
+            colour = named_colour(&lower).unwrap_or_else(|| part.trim().to_string());
+        }
+    }
+    if colour.is_empty() {
+        colour = "#000000".to_string();
+    }
+    (width.clamp(0, 40), style, colour)
+}
+
+/// The CSS colour names likely to appear in a border somebody typed by hand, so the picker opens on
+/// the colour that is actually there rather than on black. Anything else is passed through as-is.
+fn named_colour(name: &str) -> Option<String> {
+    let hex = match name {
+        "black" => "#000000",
+        "white" => "#ffffff",
+        "red" => "#ff0000",
+        "green" => "#008000",
+        "lime" => "#00ff00",
+        "blue" => "#0000ff",
+        "yellow" => "#ffff00",
+        "orange" => "#ffa500",
+        "purple" => "#800080",
+        "grey" | "gray" => "#808080",
+        "silver" => "#c0c0c0",
+        "navy" => "#000080",
+        "teal" => "#008080",
+        "maroon" => "#800000",
+        _ => return None,
+    };
+    Some(hex.to_string())
 }
 
 /// One document's overrides: **selector** → style.
@@ -372,6 +446,9 @@ pub fn parse_custom_css(css: &str) -> CustomStyles {
             match property.trim() {
                 "font-family" => style.font_family = value,
                 "font-size" => style.font_size = value,
+                "font-weight" => style.font_weight = value,
+                "font-style" => style.font_style = value,
+                "text-decoration" => style.text_decoration = value,
                 "color" => style.colour = value,
                 "background" => style.background = value,
                 "border" => style.border = value,
@@ -529,6 +606,23 @@ pub fn cursor_script() -> String {
              }}
              return false;
            }},
+           /* A fingerprint of the document's CONTENT, used to tell whether anything was typed
+              since a style change. Handles and editing markers are stripped out first, so
+              minting `wg-i3` onto an element does not read as an edit -- only real content does.
+              djb2 plus the length: a hash rather than the markup itself, because a document with
+              embedded pictures is megabytes and this crosses the boundary on every undo. */
+           fingerprint: function () {{
+             let s = document.body ? document.body.innerHTML : '';
+             s = s.replace(/\\s*\\bwg-(cursor|selected|i\\d+)\\b/g, '');
+             /* Removing the tokens leaves `class=\"\"` behind on an element that had no class
+                attribute at all before a handle was minted onto it. Without this the fingerprint
+                MOVES when a handle appears, an undo reads that as a text edit, and it takes back
+                the wrong thing -- measured, in exactly Piers' a1..a5 sequence. */
+             s = s.replace(/\\s*class=\"\\s*\"/g, '');
+             let h = 5381;
+             for (let i = 0; i < s.length; i++) {{ h = (((h * 33) ^ s.charCodeAt(i)) >>> 0); }}
+             return h + ':' + s.length;
+           }},
            describe: function () {{
              const el = window.wgCursor.el();
              if (!el) return '';
@@ -599,24 +693,6 @@ pub fn claim_instance_script(class: &str) -> String {
            return '.' + minted;
          }})({class})",
         class = crate::js::string(class),
-    )
-}
-
-/// Take the minted handle back off the cursor element, for when it returns to the tag's rule.
-///
-/// Only ever removes classes *we* minted. An `id` is the document's own and might mean something to
-/// somebody, so it stays — only its rule in our block goes.
-pub fn release_instance_script() -> String {
-    format!(
-        "(function () {{
-           const el = window.wgCursor.el();
-           if (!el) return '';
-           Array.from(el.classList).forEach(function (c) {{
-             if (/^{prefix}\\d+$/.test(c)) el.classList.remove(c);
-           }});
-           return window.wgCursor.describe();
-         }})()",
-        prefix = INSTANCE_CLASS_PREFIX,
     )
 }
 
@@ -781,6 +857,71 @@ mod tests {
         let parsed = parse_custom_css(v1);
         assert_eq!(parsed["h1"].colour, "#003366");
         assert!(custom_css(&parsed).contains("v2"));
+    }
+
+    #[test]
+    fn bold_and_underline_round_trip() {
+        // Piers' use case: all paragraphs bold, then one of them bold AND underlined.
+        let mut styles = CustomStyles::new();
+        styles.insert("p".into(), TagStyle { font_weight: "bold".into(), ..Default::default() });
+        styles.insert(
+            ".wg-i1".into(),
+            TagStyle {
+                font_weight: "bold".into(),
+                text_decoration: "underline".into(),
+                ..Default::default()
+            },
+        );
+        let css = custom_css(&styles);
+        assert!(css.contains("p { font-weight: bold; }"), "{css}");
+        assert!(css.contains(".wg-i1 { font-weight: bold; text-decoration: underline; }"), "{css}");
+        assert_eq!(parse_custom_css(&css), styles);
+    }
+
+    #[test]
+    fn an_explicit_normal_is_kept_because_it_undoes_an_inherited_bold() {
+        let parsed = parse_custom_css("li { font-weight: normal; font-style: italic; }");
+        assert_eq!(parsed["li"].font_weight, "normal");
+        assert_eq!(parsed["li"].font_style, "italic");
+        assert!(!parsed["li"].is_empty());
+    }
+
+    #[test]
+    fn a_zero_width_border_writes_no_declaration_at_all() {
+        // Piers' rule: "0px = remove all border code from that stanza of CSS".
+        assert_eq!(compose_border(0, "solid", "#cc0000"), "");
+        let style = TagStyle { border: compose_border(0, "solid", "#cc0000"), ..Default::default() };
+        assert!(style.is_empty(), "nothing else set, so the rule disappears too");
+        let mut styles = CustomStyles::new();
+        styles.insert("img".into(), TagStyle {
+            colour: "#111111".into(),
+            border: compose_border(0, "dashed", "#cc0000"),
+            ..Default::default()
+        });
+        let css = custom_css(&styles);
+        assert!(css.contains("color: #111111;"), "{css}");
+        assert!(!css.contains("border"), "no border code survives a 0px width:\n{css}");
+    }
+
+    #[test]
+    fn the_three_border_pickers_round_trip() {
+        for (w, st, c) in [(1, "solid", "#cc0000"), (3, "dashed", "#00aa00"), (12, "double", "#0000ff")] {
+            let composed = compose_border(w, st, c);
+            assert_eq!(composed, format!("{w}px {st} {c}"));
+            assert_eq!(parse_border(&composed), (w, st.to_string(), c.to_string()));
+        }
+    }
+
+    #[test]
+    fn a_hand_written_border_is_read_into_the_pickers() {
+        // Order does not matter, names are resolved, and case is irrelevant.
+        assert_eq!(parse_border("1px solid red"), (1, "solid".into(), "#ff0000".into()));
+        assert_eq!(parse_border("DOTTED 2px #ABCDEF"), (2, "dotted".into(), "#ABCDEF".into()));
+        assert_eq!(parse_border("none"), (0, "solid".into(), "#000000".into()));
+        assert_eq!(parse_border(""), (0, "solid".into(), "#000000".into()));
+        // An unknown keyword is not mistaken for a style.
+        assert_eq!(parse_border("4px groove rebeccapurple").0, 4);
+        assert_eq!(parse_border("4px groove rebeccapurple").1, "groove");
     }
 
     #[test]

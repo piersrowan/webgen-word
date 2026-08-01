@@ -54,6 +54,9 @@ use crate::State;
 /// Wide enough for a colour chip and a font button, narrow enough to leave the document the window.
 const SIDEBAR_WIDTH: i32 = 300;
 
+const WEIGHTS: &[&str] = &["—", "normal", "bold"];
+const SLANTS: &[&str] = &["—", "normal", "italic"];
+const DECORATIONS: &[&str] = &["—", "none", "underline", "line-through"];
 const FLOATS: &[&str] = &["—", "left", "right", "none"];
 const ALIGNS: &[&str] = &["—", "left", "center", "right", "justify"];
 
@@ -67,6 +70,9 @@ pub struct Sidebar {
     pub set_open: Rc<dyn Fn(bool)>,
     /// Whether it is currently showing.
     pub is_open: Rc<dyn Fn() -> bool>,
+    /// Re-read the selected element and its style from the document. Undo and redo change the
+    /// overrides underneath the panel, and rows left showing the old values would re-apply them.
+    pub refresh: Rc<dyn Fn()>,
 }
 
 /// Everything the panel needs to remember between one asynchronous DOM answer and the next.
@@ -182,15 +188,44 @@ pub fn build(
     font_row.add_suffix(&font);
     group.add(&font_row);
 
+    // Bold / italic / underline. Combos rather than switches because "say nothing" and "explicitly
+    // normal" are different answers: an explicit `normal` is how you take the bold off an element
+    // that inherits it, and a switch cannot express the difference.
+    let weight = adw::ComboRow::new();
+    weight.set_title("Weight");
+    weight.set_model(Some(&gtk::StringList::new(WEIGHTS)));
+    group.add(&weight);
+
+    let slant = adw::ComboRow::new();
+    slant.set_title("Italic");
+    slant.set_model(Some(&gtk::StringList::new(SLANTS)));
+    group.add(&slant);
+
+    let decoration = adw::ComboRow::new();
+    decoration.set_title("Underline");
+    decoration.set_model(Some(&gtk::StringList::new(DECORATIONS)));
+    group.add(&decoration);
+
     let text_colour = ColourRow::new("Text colour", settings, "#1a1a1a");
     group.add(&text_colour.row);
     let background = ColourRow::new("Background", settings, "#ffffff");
     group.add(&background.row);
 
-    let border = adw::EntryRow::new();
-    border.set_title("Border");
-    border.set_tooltip_text(Some("A CSS border, e.g. 1px solid red"));
-    group.add(&border);
+    // Border: three pickers, not a string to get wrong. **Width 0 removes the declaration
+    // entirely** rather than writing `border: none` -- Piers' rule, and the one that leaves the
+    // stanza clean.
+    let border_width = adw::SpinRow::with_range(0.0, 40.0, 1.0);
+    border_width.set_title("Border width");
+    border_width.set_subtitle("0 removes the border");
+    group.add(&border_width);
+
+    let border_style = adw::ComboRow::new();
+    border_style.set_title("Border style");
+    border_style.set_model(Some(&gtk::StringList::new(docstyle::BORDER_STYLES)));
+    group.add(&border_style);
+
+    let border_colour = ColourRow::new("Border colour", settings, "#000000");
+    group.add(&border_colour.row);
 
     let radius = adw::SpinRow::with_range(0.0, 60.0, 1.0);
     radius.set_title("Corner radius");
@@ -287,10 +322,14 @@ pub fn build(
     // --- moving values between the rows and the document ----------------------------------------
     let load_rows: Rc<dyn Fn()> = {
         let ui = ui.clone();
-        let (font, border, radius, shadow, padding, margin, float, align) = (
-            font.clone(), border.clone(), radius.clone(), shadow.clone(),
+        let (font, radius, shadow, padding, margin, float, align) = (
+            font.clone(), radius.clone(), shadow.clone(),
             padding.clone(), margin.clone(), float.clone(), align.clone(),
         );
+        let (weight, slant, decoration) = (weight.clone(), slant.clone(), decoration.clone());
+        let (weight, slant, decoration) = (weight.clone(), slant.clone(), decoration.clone());
+        let (border_width, border_style, border_colour) =
+            (border_width.clone(), border_style.clone(), border_colour.clone());
         let (text_colour, background) = (text_colour.clone(), background.clone());
         let font_touched = font_touched.clone();
         Rc::new(move || {
@@ -312,9 +351,23 @@ pub fn build(
                 .parse::<f64>()
                 .unwrap_or(11.0);
             font.set_font_desc(&gtk::pango::FontDescription::from_string(&format!("{family} {size}")));
+            weight.set_selected(WEIGHTS.iter().position(|w| *w == style.font_weight).unwrap_or(0) as u32);
+            slant.set_selected(SLANTS.iter().position(|w| *w == style.font_style).unwrap_or(0) as u32);
+            decoration.set_selected(
+                DECORATIONS.iter().position(|d| *d == style.text_decoration).unwrap_or(0) as u32,
+            );
             text_colour.set_hex(&style.colour);
             background.set_hex(&style.background);
-            border.set_text(&style.border);
+            let (bw, bs, bc) = docstyle::parse_border(&style.border);
+            border_width.set_value(bw as f64);
+            border_style.set_selected(
+                docstyle::BORDER_STYLES.iter().position(|s| *s == bs).unwrap_or(0) as u32,
+            );
+            if bw > 0 {
+                border_colour.set_hex(&bc);
+            } else {
+                border_colour.set_hex("");
+            }
             radius.set_value(style.radius.trim_end_matches("px").parse::<f64>().unwrap_or(0.0));
             shadow.set_active(!style.shadow.is_empty());
             padding.set_text(&style.padding);
@@ -326,10 +379,12 @@ pub fn build(
     };
 
     let collect: Rc<dyn Fn() -> TagStyle> = {
-        let (font, border, radius, shadow, padding, margin, float, align) = (
-            font.clone(), border.clone(), radius.clone(), shadow.clone(),
+        let (font, radius, shadow, padding, margin, float, align) = (
+            font.clone(), radius.clone(), shadow.clone(),
             padding.clone(), margin.clone(), float.clone(), align.clone(),
         );
+        let (border_width, border_style, border_colour) =
+            (border_width.clone(), border_style.clone(), border_colour.clone());
         let (text_colour, background) = (text_colour.clone(), background.clone());
         let font_touched = font_touched.clone();
         Rc::new(move || {
@@ -350,9 +405,22 @@ pub fn build(
             TagStyle {
                 font_family: family,
                 font_size: size,
+                font_weight: pick(WEIGHTS, weight.selected()),
+                font_style: pick(SLANTS, slant.selected()),
+                text_decoration: pick(DECORATIONS, decoration.selected()),
                 colour: text_colour.hex_or_empty(),
                 background: background.hex_or_empty(),
-                border: border.text().trim().to_string(),
+                border: docstyle::compose_border(
+                    border_width.value() as i64,
+                    docstyle::BORDER_STYLES
+                        .get(border_style.selected() as usize)
+                        .copied()
+                        .unwrap_or("solid"),
+                    &{
+                        let c = border_colour.hex_or_empty();
+                        if c.is_empty() { "#000000".to_string() } else { c }
+                    },
+                ),
                 radius: if radius.value() > 0.0 { format!("{}px", radius.value() as i64) } else { String::new() },
                 shadow: if shadow.is_active() { docstyle::HOUSE_SHADOW.to_string() } else { String::new() },
                 padding: padding.text().trim().to_string(),
@@ -456,13 +524,11 @@ pub fn build(
         apply_b.connect_clicked(move |_| {
             let style = collect();
             let Some(selected) = ui.selected.borrow().clone() else { return };
+            let before = ui.state.borrow().custom.clone();
 
             if ui.instance_scope.get() {
                 // This element alone. Mint it a handle if it has none, then write the override.
-                let minted = docstyle::next_instance_class(
-                    &ui.state.borrow().custom,
-                    selected.highest_instance,
-                );
+                let minted = docstyle::next_instance_class(&before, selected.highest_instance);
                 let ui2 = ui.clone();
                 let show_selected = show_selected.clone();
                 ui.view.evaluate_javascript(
@@ -475,58 +541,34 @@ pub fn build(
                         if selector.is_empty() {
                             return;
                         }
-                        {
-                            let mut st = ui2.state.borrow_mut();
-                            if style.is_empty() {
-                                st.custom.remove(&selector);
-                            } else {
-                                st.custom.insert(selector.clone(), style.clone());
-                            }
+                        let mut after = before.clone();
+                        if style.is_empty() {
+                            after.remove(&selector);
+                        } else {
+                            after.insert(selector.clone(), style.clone());
                         }
-                        write_block(&ui2);
-                        // The element may have just gained a handle, so re-read it.
-                        let show_selected = show_selected.clone();
-                        ui2.view.evaluate_javascript(
-                            "window.wgCursor.describe()",
-                            None,
-                            None,
-                            gtk::gio::Cancellable::NONE,
-                            move |res| {
-                                let record = res.map(|v| v.to_str().to_string()).unwrap_or_default();
-                                show_selected(Selected::parse(&record));
-                            },
-                        );
+                        commit(&ui2, before.clone(), after, show_selected.clone());
                     },
                 );
             } else {
                 // Every element of this kind — and this element stops departing from it.
-                {
-                    let mut st = ui.state.borrow_mut();
-                    if style.is_empty() {
-                        st.custom.remove(&selected.tag);
-                    } else {
-                        st.custom.insert(selected.tag.clone(), style);
-                    }
-                    // "on [Apply] the element specific CSS is deleted leaving the page wide CSS to
-                    // apply" — the override goes whether it was a minted class or the element's own
-                    // id, so what is on screen is now the page-wide rule and nothing else.
-                    if !selected.instance.is_empty() {
-                        st.custom.remove(&selected.instance);
-                    }
+                let mut after = before.clone();
+                if style.is_empty() {
+                    after.remove(&selected.tag);
+                } else {
+                    after.insert(selected.tag.clone(), style);
                 }
-                write_block(&ui);
-                // Take the minted class back off the element so dead handles do not accumulate.
-                let show_selected = show_selected.clone();
-                ui.view.evaluate_javascript(
-                    &docstyle::release_instance_script(),
-                    None,
-                    None,
-                    gtk::gio::Cancellable::NONE,
-                    move |res| {
-                        let record = res.map(|v| v.to_str().to_string()).unwrap_or_default();
-                        show_selected(Selected::parse(&record));
-                    },
-                );
+                // "on [Apply] the element specific CSS is deleted leaving the page wide CSS to
+                // apply" — the override goes whether it was a minted class or the element's own id.
+                //
+                // The minted CLASS stays on the element, deliberately. Taking it off here would
+                // make this un-undoable: nothing could find the element again to put it back. It is
+                // inert without a rule, it is reused if the element is overridden again, and the
+                // save path drops handles that no rule refers to, so it never reaches the file.
+                if !selected.instance.is_empty() {
+                    after.remove(&selected.instance);
+                }
+                commit(&ui, before, after, show_selected.clone());
             }
         });
     }
@@ -575,7 +617,66 @@ pub fn build(
         Rc::new(move || root.reveals_child())
     };
 
-    Sidebar { root, select_at, set_open, is_open }
+    let refresh: Rc<dyn Fn()> = {
+        let root = root.clone();
+        let refresh_from = refresh_from.clone();
+        Rc::new(move || {
+            if root.reveals_child() {
+                refresh_from("window.wgCursor ? window.wgCursor.describe() : ''".to_string());
+            }
+        })
+    };
+
+    Sidebar { root, select_at, set_open, is_open, refresh }
+}
+
+/// The chosen value from a combo whose first entry is the "say nothing" dash.
+fn pick(options: &[&str], selected: u32) -> String {
+    options.get(selected as usize).copied().filter(|v| *v != "—").unwrap_or("").to_string()
+}
+
+/// Put a new set of overrides into the document, remember how to take it back, and refresh the
+/// panel from whatever the document says afterwards.
+fn commit(
+    ui: &Rc<Ui>,
+    before: docstyle::CustomStyles,
+    after: docstyle::CustomStyles,
+    show_selected: Rc<dyn Fn(Option<Selected>)>,
+) {
+    if before == after {
+        return;
+    }
+    ui.state.borrow_mut().custom = after.clone();
+    write_block(ui);
+
+    // The fingerprint is read *after* applying, which is the same value as before it: a style
+    // change never moves it. It is what lets Undo tell a style change from a text edit.
+    let ui2 = ui.clone();
+    ui.view.evaluate_javascript(
+        crate::undo::FINGERPRINT_JS,
+        None,
+        None,
+        gtk::gio::Cancellable::NONE,
+        move |res| {
+            let fingerprint = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+            crate::undo::record(
+                &ui2.state,
+                crate::undo::StyleStep { before, after, fingerprint },
+            );
+            // The element may have just gained a handle, so re-read it.
+            let show_selected = show_selected.clone();
+            ui2.view.evaluate_javascript(
+                "window.wgCursor.describe()",
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    let record = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+                    show_selected(Selected::parse(&record));
+                },
+            );
+        },
+    );
 }
 
 /// Say plainly which rule the next Apply will write, because the two scopes look identical.
