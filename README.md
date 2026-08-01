@@ -387,6 +387,11 @@ so older text comes back before the style step does. The end state after undoing
 same; only the middle differs. When WebKit reports it has nothing left, style steps are taken
 regardless, so none is ever stranded.
 
+## Open tasks
+
+[TASKS.md](TASKS.md) is the live list — what is outstanding, what is waiting on a decision, what
+is unverified and why, and what other sessions have been asked for.
+
 ## Known debt
 
 `src/stylerows.rs` is the shared style-row widget the table window's CSS panel uses. The document
