@@ -1,0 +1,141 @@
+# WebGen Word — the BASE document style, rendered generically by System Settings from this file
+# (CONTRACT.md §3). Word writes no GTK for this panel.
+#
+# Everything here is a *base*: the style a document inherits and the geometry a NEW document starts
+# from. A particular document's departures from it live in the document itself, in its
+# `webgen-doc-custom` style block, and are edited in Word under Menu > This document's style.
+#
+# Only global scalars belong in a manifest, which is exactly what these are.
+
+app_id = "com.webgen.Word"
+title  = "Word"
+
+# --- Text ---------------------------------------------------------------------------------------
+
+[[setting]]
+key = "doc_font"
+type = "font"
+label = "Document font"
+group = "Text"
+default = "DejaVu Sans 11"
+
+[[setting]]
+key = "doc_line_height_pct"
+type = "i64"
+label = "Line spacing (% of font size)"
+group = "Text"
+default = 145
+min = 100
+max = 300
+
+[[setting]]
+key = "doc_text_colour"
+type = "colour"
+label = "Text colour"
+group = "Text"
+default = "#1a1a1a"
+
+[[setting]]
+key = "doc_heading_colour"
+type = "colour"
+label = "Heading colour"
+group = "Text"
+default = "#111111"
+
+[[setting]]
+key = "doc_link_colour"
+type = "colour"
+label = "Link colour"
+group = "Text"
+default = "#1a5fb4"
+
+[[setting]]
+key = "doc_rule_colour"
+type = "colour"
+label = "Heading rule colour"
+group = "Text"
+default = "#333333"
+
+# --- Page ---------------------------------------------------------------------------------------
+# The default a NEW document starts from. An existing document carries its own in
+# `<meta name="webgen-page">` and that always wins — otherwise opening a CV authored at A5 would
+# print it at A4, which is the bug this pair of settings exists to close.
+
+[[setting]]
+key = "page_paper"
+type = "enum"
+label = "Paper size"
+group = "Page"
+default = "A4"
+options = ["A4", "Letter", "Legal", "A5"]
+
+[[setting]]
+key = "page_margin_top_mm"
+type = "i64"
+label = "Top margin (mm)"
+group = "Page"
+default = 20
+min = 0
+max = 60
+
+[[setting]]
+key = "page_margin_right_mm"
+type = "i64"
+label = "Right margin (mm)"
+group = "Page"
+default = 20
+min = 0
+max = 60
+
+[[setting]]
+key = "page_margin_bottom_mm"
+type = "i64"
+label = "Bottom margin (mm)"
+group = "Page"
+default = 20
+min = 0
+max = 60
+
+[[setting]]
+key = "page_margin_left_mm"
+type = "i64"
+label = "Left margin (mm)"
+group = "Page"
+default = 20
+min = 0
+max = 60
+
+# --- Pictures -----------------------------------------------------------------------------------
+# Pictures are embedded in the document as data URIs, so these travel with the file.
+
+[[setting]]
+key = "doc_img_border_px"
+type = "i64"
+label = "Picture border (px)"
+group = "Pictures"
+default = 0
+min = 0
+max = 20
+
+[[setting]]
+key = "doc_img_border_colour"
+type = "colour"
+label = "Picture border colour"
+group = "Pictures"
+default = "#dddddd"
+
+[[setting]]
+key = "doc_img_radius_px"
+type = "i64"
+label = "Picture corner radius (px)"
+group = "Pictures"
+default = 0
+min = 0
+max = 60
+
+[[setting]]
+key = "doc_img_shadow"
+type = "bool"
+label = "Picture drop shadow"
+group = "Pictures"
+default = false
