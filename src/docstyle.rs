@@ -205,7 +205,8 @@ pub const STYLEABLE_TAGS: &[&str] = &[
 
 /// The properties offered per tag. Kept deliberately short: this is document preparation, not a CSS
 /// editor — every one of these is a thing a writer wants, and nothing here can break layout.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TagStyle {
     pub font_family: String,
     pub font_size: String,  // e.g. "1.2em" or "18px"
@@ -226,6 +227,8 @@ pub struct TagStyle {
     /// not that. e.g. "12px".
     pub padding: String,
     pub margin: String,
+    /// e.g. `100%` or `12em`. Tables want it most, but a picture or a block can use it too.
+    pub width: String,
     /// Pictures and floated blocks: how the text sits around them.
     pub float: String,      // left | right | none
     pub text_align: String, // left | center | right | justify
@@ -236,7 +239,7 @@ impl TagStyle {
         *self == TagStyle::default()
     }
 
-    fn declarations(&self) -> Vec<(&'static str, &str)> {
+    pub fn declarations(&self) -> Vec<(&'static str, &str)> {
         let mut out = Vec::new();
         for (prop, value) in [
             ("font-family", self.font_family.as_str()),
@@ -251,6 +254,7 @@ impl TagStyle {
             ("box-shadow", self.shadow.as_str()),
             ("padding", self.padding.as_str()),
             ("margin", self.margin.as_str()),
+            ("width", self.width.as_str()),
             ("float", self.float.as_str()),
             ("text-align", self.text_align.as_str()),
         ] {
@@ -456,6 +460,7 @@ pub fn parse_custom_css(css: &str) -> CustomStyles {
                 "box-shadow" => style.shadow = value,
                 "padding" => style.padding = value,
                 "margin" => style.margin = value,
+                "width" => style.width = value,
                 "float" => style.float = value,
                 "text-align" => style.text_align = value,
                 _ => {}

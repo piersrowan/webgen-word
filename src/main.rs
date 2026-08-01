@@ -38,6 +38,9 @@ mod page;
 mod sanitise;
 mod settings;
 mod sidebar;
+mod stylerows;
+mod table;
+mod table_window;
 mod undo;
 
 use adw::prelude::*;
@@ -258,6 +261,9 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
 
     let image_b = tool("insert-image-symbolic", "Insert picture — embedded in the document");
     fmt.append(&image_b);
+
+    let table_b = tool("view-grid-symbolic", "Table — insert one here, or edit the one the cursor is in");
+    fmt.append(&table_b);
 
     // A page break is the one thing a CV genuinely needs and HTML has no key for. It goes in as a
     // styled `<hr>`; the stylesheet turns it into `break-before: page` and draws it while editing.
@@ -734,6 +740,64 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         });
     }
 
+    // --- tables -----------------------------------------------------------------------------------
+    // One button, two jobs: inside a table it opens that table, anywhere else it starts a new one.
+    // Which it is has to be asked of the document, so the whole thing is a chain of callbacks.
+    {
+        let view = view.clone();
+        let window = window.clone();
+        let settings = settings.clone();
+        let say = say.clone();
+        table_b.connect_clicked(move |_| {
+            let (view, window, settings, say) =
+                (view.clone(), window.clone(), settings.clone(), say.clone());
+            view.clone().evaluate_javascript(
+                &table::find_at_cursor_script(),
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    let json = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+                    if let Some(existing) = table::Table::from_json(&table::unescape_attr(&json)) {
+                        let (view, say) = (view.clone(), say.clone());
+                        table_window::open(
+                            &window,
+                            &settings,
+                            existing.clone(),
+                            false,
+                            Rc::new(move |outcome| apply_table(&view, &say, outcome, Some(&existing))),
+                        );
+                        return;
+                    }
+                    // Nothing under the cursor: a new one, numbered so it cannot collide with a
+                    // table whose block was deleted and re-added.
+                    let (view2, window, settings, say) =
+                        (view.clone(), window.clone(), settings.clone(), say.clone());
+                    view.evaluate_javascript(
+                        &table::highest_id_script(),
+                        None,
+                        None,
+                        gtk::gio::Cancellable::NONE,
+                        move |res| {
+                            let highest = res
+                                .map(|v| v.to_str().to_string())
+                                .ok()
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(0);
+                            let (view, say) = (view2.clone(), say.clone());
+                            table_window::ask_size(
+                                &window,
+                                &settings,
+                                highest + 1,
+                                Rc::new(move |outcome| apply_table(&view, &say, outcome, None)),
+                            );
+                        },
+                    );
+                },
+            );
+        });
+    }
+
     // --- close -----------------------------------------------------------------------------------
     // Close puts the FILE down and leaves the window open on a fresh blank document. Quitting to get
     // rid of a file, or opening another one just to displace it, were the only ways to do this.
@@ -908,6 +972,35 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     tv.set_content(Some(&content));
     window.set_content(Some(&tv));
     window.present();
+}
+
+/// Put what the Table Window decided into the document.
+///
+/// Saving an existing table replaces everything between its boundary markers; saving a new one puts
+/// a block in at the caret. Deleting takes the block out. In every case the markup is *generated*
+/// from the model rather than patched, which is what keeps the document and the JSON in step.
+fn apply_table(
+    view: &webkit6::WebView,
+    say: &Rc<impl Fn(&str) + 'static>,
+    outcome: table_window::Outcome,
+    existing: Option<&table::Table>,
+) {
+    let script = match (&outcome, existing) {
+        (table_window::Outcome::Save(table), Some(old)) => {
+            table::replace_block_script(&old.class(), &table.to_block())
+        }
+        (table_window::Outcome::Save(table), None) => table::insert_block_script(&table.to_block()),
+        (table_window::Outcome::Delete, Some(old)) => table::replace_block_script(&old.class(), ""),
+        // Deleting a table that was never inserted is just not inserting it.
+        (table_window::Outcome::Delete, None) => return,
+    };
+    let say = say.clone();
+    view.evaluate_javascript(&script, None, None, gtk::gio::Cancellable::NONE, move |res| {
+        let ok = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+        if ok.is_empty() {
+            say("The table could not be placed in the document — nothing was changed.");
+        }
+    });
 }
 
 /// Translate a click on the window into the WebView's own coordinates, or `None` when it landed

@@ -109,7 +109,8 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
 
 ## Verified
 
-- `cargo test` — 68 tests: the sanitiser (including a script containing markup, nested drops,
+- `cargo test` — 84 tests, 16 of them on the table grid alone (merge, split, insert and delete
+  through a span, refusing a merge that would half-swallow a cell, and the JSON round trip): the sanitiser (including a script containing markup, nested drops,
   idempotence, and that a clean document comes back byte for byte), the page-setup round trip
   through the document meta, the style round trip through the fixed layout including instance
   rules, selector validation, and document preparation.
@@ -123,6 +124,13 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
   overridden picture opens on *This one* showing green; clicking the other opens on *All* showing red.
 - Tree navigation: `<SPAN>` → up → `<LI>` → up → `<UL>` → down → `<LI>` → down → `<SPAN>`, with the
   arrows greying out at the ends.
+- **The whole table process, driven end to end.** Cursor in a paragraph → grid button → 3×3 →
+  Table Window → type into three cells → merge right (the caption reads "merged 1×2" and the cell
+  holds "one two") → Save. The block lands **between** the two paragraphs with both intact, the
+  markup is the shape above, and the merge is `colspan="2"`. Clicking inside that table and pressing
+  the button again reopens it **with the merge preserved** — proving the JSON round trip through the
+  document. Three clicks on Border width in the CSS panel put `border: 3px solid #000000` on
+  `table.wg-t1` and nowhere else. Delete removes block, style and table, leaving both paragraphs.
 - **Piers' a1–a5 undo sequence, driven end to end.** Type into a four-paragraph document, make all
   paragraphs bold, underline one of them, then Ctrl+Z twice: both style rules are gone from the file
   and **the typed text is still there**. Ctrl+Y twice puts both rules back exactly. The sidebar's
@@ -211,6 +219,57 @@ Both look like broken code until you know them, and both are in the comments:
 - It must be `pressed`, not `released`. WebKit claims the event sequence in the target phase, which
   **cancels** the gesture before any release arrives.
 
+## Tables
+
+Tables are painful to get right, and the reason is that a table is the one genuinely
+two-dimensional thing in a document. A merged cell means the row below it has fewer cells than the
+table has columns, so "insert a column" is not "push a cell into every row" and "what is at row 3,
+column 2" is not `rows[3][2]`. `src/table.rs` exists to keep that straight and its tests are where
+it is actually kept straight.
+
+### The process
+
+Put the cursor where the table goes and press the grid button → say how many rows and columns →
+the **Table Window** opens. Everything about a table happens there: cell text, add and remove rows
+and columns, merge and split, bold/italic/underline and alignment per cell, and the table's own CSS
+on the right. **Save** regenerates the block in the document; **Delete** takes it out. Put the
+cursor inside a table and press the same button to reopen it.
+
+Nothing edits a table in the document itself. That is deliberate — every editor that has tried to be
+both a stream and a grid at once has ended up with cells you cannot select and merges you cannot
+undo.
+
+### What a table is on disk
+
+```html
+<!-- table block -->
+<style>
+table.wg-t1 { border-collapse: collapse; }
+.wg-t1 th { font-weight: bold; border: 1px solid #999999; padding: 4px 8px; }
+</style>
+<table class="wg-t1" data-wg-table="{…json…}">
+  <thead><tr><th>Heading 1</th></tr></thead>
+  <tbody><tr><td colspan="2">one two</td></tr></tbody>
+</table>
+<!-- END table block -->
+```
+
+Three things there are load-bearing:
+
+- **The comments delimit what gets replaced.** Saving regenerates everything between them rather
+  than patching markup in place.
+- **The CSS is scoped to `.wg-tN`.** The style block sits in the document, so an unscoped
+  `table { … }` would restyle every table in the file. The editor talks in terms of `table`,
+  `thead tr`, `td`, `tbody tr:nth-child(odd)`; the prefix is added on the way out.
+- **The JSON is the truth**, and it lives in `data-wg-table`. Reopening a table parses the
+  attribute, not the markup, so the editor never has to guess what a `rowspan` meant. It is not in
+  the comment because a cell containing `-->` would end the block early, and not in a
+  `<script type="application/json">` because a word processor that strips script should not make
+  exceptions to that.
+
+`border-collapse: collapse` is emitted for every table and is not a knob — a document table with
+separated borders looks like a mistake, and there is no reason to offer the mistake.
+
 ## Undo covers the last action, whatever kind it was
 
 WebKit's undo stack knows about typing, pasting and the toolbar's editing commands. It knows nothing
@@ -240,6 +299,14 @@ down. The text undoes newest-first as it should, but WebKit's stack runs on past
 so older text comes back before the style step does. The end state after undoing everything is the
 same; only the middle differs. When WebKit reports it has nothing left, style steps are taken
 regardless, so none is ever stranded.
+
+## Known debt
+
+`src/stylerows.rs` is the shared style-row widget the table window's CSS panel uses. The document
+style sidebar still has its own copy of the same rows, written before the extraction. They agree
+today because they were the same code an hour ago; they will drift. The sidebar should adopt
+`StyleRows` — it is a mechanical change, and the two driving scripts that verify the sidebar make it
+cheap to check.
 
 ## Not done yet
 

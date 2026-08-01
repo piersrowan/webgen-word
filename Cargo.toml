@@ -1,6 +1,6 @@
 [package]
 name = "webgen-word"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 authors = ["webgen <piers.rowan@webgen.com.au>"]
@@ -21,6 +21,11 @@ path = "src/main.rs"
 gtk = { version = "0.9", package = "gtk4", features = ["v4_10"] }
 adw = { version = "0.7", package = "libadwaita", features = ["v1_4"] }
 webkit6 = "0.4"
+# Tables are stored as JSON in the document, and a format that must round-trip exactly is the
+# wrong place to hand-roll a parser. Both are already vendored for the browser, so the OS build
+# gains nothing new.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Settings storage, per CONTRACT.md §2. A git dependency, not a path one: a path dep does not
 # survive `cargo vendor` for the offline OS build. Same pinned rev as the browser and swatch, so the
 # whole family links one copy and the types line up.

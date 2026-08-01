@@ -245,6 +245,11 @@ pub fn build(
     margin.set_tooltip_text(Some("One value for all four sides, e.g. 6px"));
     group.add(&margin);
 
+    let width = adw::EntryRow::new();
+    width.set_title("Width");
+    width.set_tooltip_text(Some("e.g. 100% or 12em"));
+    group.add(&width);
+
     let float = adw::ComboRow::new();
     float.set_title("Float");
     float.set_subtitle("Text wraps the other side");
@@ -326,6 +331,7 @@ pub fn build(
             font.clone(), radius.clone(), shadow.clone(),
             padding.clone(), margin.clone(), float.clone(), align.clone(),
         );
+        let width = width.clone();
         let (weight, slant, decoration) = (weight.clone(), slant.clone(), decoration.clone());
         let (weight, slant, decoration) = (weight.clone(), slant.clone(), decoration.clone());
         let (border_width, border_style, border_colour) =
@@ -372,6 +378,7 @@ pub fn build(
             shadow.set_active(!style.shadow.is_empty());
             padding.set_text(&style.padding);
             margin.set_text(&style.margin);
+            width.set_text(&style.width);
             float.set_selected(FLOATS.iter().position(|f| *f == style.float).unwrap_or(0) as u32);
             align.set_selected(ALIGNS.iter().position(|a| *a == style.text_align).unwrap_or(0) as u32);
             ui.loading.set(false);
@@ -383,6 +390,7 @@ pub fn build(
             font.clone(), radius.clone(), shadow.clone(),
             padding.clone(), margin.clone(), float.clone(), align.clone(),
         );
+        let width = width.clone();
         let (border_width, border_style, border_colour) =
             (border_width.clone(), border_style.clone(), border_colour.clone());
         let (text_colour, background) = (text_colour.clone(), background.clone());
@@ -425,6 +433,7 @@ pub fn build(
                 shadow: if shadow.is_active() { docstyle::HOUSE_SHADOW.to_string() } else { String::new() },
                 padding: padding.text().trim().to_string(),
                 margin: margin.text().trim().to_string(),
+                width: width.text().trim().to_string(),
                 float: FLOATS.get(float.selected() as usize).copied().filter(|f| *f != "—").unwrap_or("").to_string(),
                 text_align: ALIGNS.get(align.selected() as usize).copied().filter(|a| *a != "—").unwrap_or("").to_string(),
             }
