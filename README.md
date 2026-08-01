@@ -109,7 +109,7 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
 
 ## Verified
 
-- `cargo test` — 84 tests, 16 of them on the table grid alone (merge, split, insert and delete
+- `cargo test` — 103 tests, 16 of them on the table grid alone (merge, split, insert and delete
   through a span, refusing a merge that would half-swallow a cell, and the JSON round trip): the sanitiser (including a script containing markup, nested drops,
   idempotence, and that a clean document comes back byte for byte), the page-setup round trip
   through the document meta, the style round trip through the fixed layout including instance
@@ -131,6 +131,11 @@ browser, so both link one gtk4-sys and the OS builds one WebKit. `webgen-registr
   the button again reopens it **with the merge preserved** — proving the JSON round trip through the
   document. Three clicks on Border width in the CSS panel put `border: 3px solid #000000` on
   `table.wg-t1` and nowhere else. Delete removes block, style and table, leaving both paragraphs.
+- **Pictures land in the folder.** A document referencing `/…/pics/timmy.png`, opened and saved:
+  `cats_files/timmy.png` appears beside it, the markup becomes `src="cats_files/timmy.png"`, and the
+  document records `<meta name="webgen-assets" content="cats_files">`.
+- **Links.** Ctrl+K, an address and a label, and the saved file carries
+  `<a href="https://example.com/docs">the docs</a>`.
 - **Piers' a1–a5 undo sequence, driven end to end.** Type into a four-paragraph document, make all
   paragraphs bold, underline one of them, then Ctrl+Z twice: both style rules are gone from the file
   and **the typed text is still there**. Ctrl+Y twice puts both rules back exactly. The sidebar's
@@ -151,8 +156,15 @@ responding — the markers now come off, the document is serialised, and they go
 and took back the wrong thing; (3) a save that referenced an unbound variable failed outright, which
 only the 0.3.0 "could not read the document back" banner made visible.
 
-Not verified: on-screen editing on real WebGen hardware under labwc, the print dialog's "Print to
-File" flow end to end, and System Settings rendering the `colour` rows. All need a screen — see the
+**Not verified, and worth being precise about why:** every path that opens a `gtk::FileDialog` —
+Open, Save As, Insert picture, and both one-file exports — cannot be driven under the headless rig,
+because the xdg-desktop-portal file chooser does not work there. The *code* those dialogs hand off
+to is covered: the asset pipeline was proved end to end by opening a document that referenced an
+outside picture and pressing Ctrl+S, and the zip is unit-tested and checked by `unzip -t`. But
+clicking through the choosers themselves needs a screen.
+
+Also not verified: on-screen editing on real WebGen hardware under labwc, the print dialog's "Print
+to File" flow end to end, and System Settings rendering the `colour` rows. All need a screen — see the
 UAT queue.
 
 ## The element style sidebar
@@ -218,6 +230,56 @@ Both look like broken code until you know them, and both are in the comments:
   are translated back into the WebView's space, which is what `elementFromPoint` wants anyway.
 - It must be `pressed`, not `released`. WebKit claims the event sequence in the target phase, which
   **cancels** the gesture before any release arrives.
+
+## Where pictures live
+
+`cats.html` beside **`cats_files/`**. Visible, not hidden — a hidden folder can't be dropped a new
+`front.png` without going hunting — and named after the document, so which folder belongs to which
+document is obvious. The document says so itself in `<meta name="webgen-assets">`, which is what
+lets Word tell you *"2 pictures are not found"* instead of showing silent gaps.
+
+`<stem>_files` is not invented here: the browser's editor already writes exactly that, so a document
+with pictures moves between the two intact.
+
+**Names are kept**, and de-duplicated as `icon.png`, `icon-2.png`, `icon-3.png`. That is the whole
+point of a folder: put `front.png` and `back.png` in a brochure and then save over them from Paint
+**without opening Word at all**. Opaque names (`1.png`, `2.png` + a manifest) would solve collisions
+and kill that dead.
+
+A picture inserted into a **saved** document is copied straight into the folder. Inserted into one
+that has never been saved there is nowhere to put it, so it comes in as a `data:` URI carrying its
+name in `data-wg-name`, and the first save writes it out under that name. Save As resolves existing
+references against where they live *now* while writing the folder beside the *new* path — which is
+all "copy the folder across" needs to be.
+
+**Opening a document moves nobody's files.** The load policy reports what is missing and changes
+nothing; copying happens on save, where you can see what you agreed to.
+
+A missing picture is **reported and kept**, never deleted. The reference is how the picture comes
+back when the file is restored, and in a template `front.png` is *meant* to be absent until somebody
+saves one over it.
+
+### Two one-file forms, both "save a copy"
+
+| | |
+|---|---|
+| **`.wgz`** | an ordinary zip of the document and its folder. For sending. Entries are *stored*, not deflated — pictures are already compressed, and a compressor is a dependency the OS would have to vendor for a few percent |
+| **one file** | every picture inlined as a `data:` URI, as Word did up to 0.7.0. For pasting into an email |
+
+Opening a `.wgz` unpacks it beside itself and edits the document there. Working inside an archive is
+exactly the thing this app exists not to be. Entry names are checked rather than trusted — a zip can
+name a file `../../.bashrc`, and unpacking is where that matters.
+
+## Links
+
+Select some words and press **Ctrl+K**, or use the chain button. A web address, or `#name` to jump
+within the document. The dialog opens on the truth: the existing address if the caret is already in
+a link, the selected words if it is not, and *Remove link* only when there is one to remove. With
+nothing selected it inserts the text and links it — linking an empty selection would otherwise make
+a link with no text, invisible and unclickable.
+
+Links always survived the sanitiser — a link is a reference, not an imported asset. Until now there
+was simply no way to make one.
 
 ## The page on screen
 

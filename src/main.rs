@@ -31,6 +31,7 @@
 //! WebKit's GTK print backend takes page geometry from `gtk::PageSetup` and ignores the stylesheet
 //! entirely. That is why [`page`] exists and why Page setup is a menu item rather than a CSS comment.
 
+mod assets;
 mod doc;
 mod docstyle;
 mod js;
@@ -265,6 +266,9 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     let table_b = tool("view-grid-symbolic", "Table — insert one here, or edit the one the cursor is in");
     fmt.append(&table_b);
 
+    let link_b = tool("insert-link-symbolic", "Link…  (Ctrl+K)");
+    fmt.append(&link_b);
+
     // A page break is the one thing a CV genuinely needs and HTML has no key for. It goes in as a
     // styled `<hr>`; the stylesheet turns it into `break-before: page` and draws it while editing.
     let brk = tool("go-bottom-symbolic", "Insert page break  (Ctrl+Return)");
@@ -322,6 +326,23 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let say = say.clone();
         Rc::new(move |path: Option<PathBuf>| {
             let base = Base::from_settings(&settings);
+            // A `.wgz` is unpacked beside itself and the document inside is what actually opens.
+            // Unpacking rather than working inside the archive is deliberate: the working form is
+            // markup plus a folder, and a format you can only edit through a zip is the thing this
+            // app exists not to be.
+            let path = match path {
+                Some(p) if is_wgz(&p) => match unpack_wgz(&p) {
+                    Ok((doc, where_to)) => {
+                        say(&format!("Unpacked into {} — editing the document there.", where_to.display()));
+                        Some(doc)
+                    }
+                    Err(e) => {
+                        say(&format!("Could not open {}: {e}", p.display()));
+                        None
+                    }
+                },
+                other => other,
+            };
             let bytes = path.as_ref().map(|p| (p.clone(), std::fs::read(p)));
 
             let (html, setup, path, report) = match bytes {
@@ -330,7 +351,9 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                     let source = String::from_utf8_lossy(&raw).to_string();
                     // Cut script and imported assets out of the SOURCE. Doing this after loading
                     // would be doing it after the script had already run.
-                    let (clean, report) = sanitise::clean(&source, p.parent());
+                    // Opening does not move anybody's files about; that happens on save.
+                    let (clean, report) =
+                        sanitise::clean(&source, p.parent(), &sanitise::AssetPolicy::Keep);
                     // The document's own geometry wins over the app's default.
                     let setup = doc::page_setup_of(&clean).unwrap_or_else(|| PageSetup::from_settings(&settings));
                     (doc::prepare(&clean, &docstyle::base_css(&base, setup), setup), setup, Some(p), report)
@@ -436,17 +459,38 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
 
     // --- save ------------------------------------------------------------------------------------
     // The document is read back out of the live DOM, so what saves is exactly what is on screen.
+    // `single_file` is the export form: everything inlined as `data:` URIs, nothing beside the
+    // document. The normal save puts pictures in `<stem>_files/` next to it.
     let save_to = {
         let view = view.clone();
         let window = window.clone();
         let state = state.clone();
         let say = say.clone();
-        Rc::new(move |path: PathBuf| {
+        Rc::new(move |path: PathBuf, single_file: bool| {
             let window = window.clone();
             let state = state.clone();
             let say = say.clone();
             let title = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             let page_meta = state.borrow().setup.to_meta();
+            // Where the document's references resolve *today*. Saving somewhere else must copy the
+            // pictures across, and that falls out of resolving against the old home while writing
+            // the folder beside the new one.
+            let source_dir = state
+                .borrow()
+                .path
+                .as_ref()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .or_else(|| path.parent().map(|d| d.to_path_buf()));
+            let folder = assets::folder_name(&path);
+            let policy = if single_file {
+                sanitise::AssetPolicy::Embed
+            } else {
+                sanitise::AssetPolicy::Folder {
+                    dir: assets::folder_path(&path),
+                    name: folder.clone(),
+                }
+            };
+            let assets_meta = if single_file { String::new() } else { folder };
             // The instance selectors that still have a rule, space-delimited and padded so a
             // substring test cannot match `.wg-i1` inside `.wg-i10`.
             let live_handles = {
@@ -463,7 +507,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             // fixed the *window* title and left the document's own saying "Untitled" forever), and
             // record the page geometry so the file describes the shape it was written for.
             let script = format!(
-                "(function (title, page, live) {{
+                "(function (title, page, live, assets) {{
                    /* Three kinds of class must not reach the file: the two editing markers, and
                       any `wg-iN` handle no rule refers to any more. None of them may be removed
                       from the LIVE document, though -- removing the markers outright was a real
@@ -494,15 +538,30 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                      document.head.insertBefore(m, document.head.firstChild);
                    }}
                    m.setAttribute('content', page);
+                   /* The document says which folder is its own, so Word can tell you a picture is
+                      missing rather than showing a silent gap. */
+                   let a = document.querySelector('meta[name=\"{assets_meta_name}\"]');
+                   if (assets) {{
+                     if (!a) {{
+                       a = document.createElement('meta');
+                       a.setAttribute('name', '{assets_meta_name}');
+                       document.head.insertBefore(a, document.head.firstChild);
+                     }}
+                     a.setAttribute('content', assets);
+                   }} else if (a) {{
+                     a.remove();
+                   }}
                    const html = document.documentElement.outerHTML;
                    touched.forEach(function (p) {{ p[0].setAttribute('class', p[1]); }});
                    return html;
-                 }})({title}, {page}, {live})",
+                 }})({title}, {page}, {live}, {assets})",
                 meta = page::PAGE_META,
+                assets_meta_name = assets::META_ASSETS,
                 cursor = docstyle::CURSOR_CLASS,
                 title = js::string(&title),
                 page = js::string(&page_meta),
                 live = js::string(&live_handles),
+                assets = js::string(&assets_meta),
             );
             view.evaluate_javascript(
                 &script,
@@ -518,7 +577,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                     // Second sanitising pass. The first one cleaned the file; this one catches
                     // whatever arrived since — chiefly paste, which can carry a whole subtree in
                     // from a browser, script and all.
-                    let (clean, report) = sanitise::clean(&html, path.parent());
+                    let (clean, report) = sanitise::clean(&html, source_dir.as_deref(), &policy);
                     // `outerHTML` does not include the doctype. Saving without it put every
                     // document Word wrote into quirks mode in every browser — measured, and the
                     // single worst bug in 0.2.0 given the whole premise is "any browser opens it".
@@ -553,6 +612,25 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         })
     };
 
+    // Read the document out of the DOM, for the paths that do not go through `save_to` — the two
+    // one-file exports. `save_to` does its own read because it also makes fixups on the way past.
+    let read_document: Rc<dyn Fn(Rc<dyn Fn(String)>)> = {
+        let view = view.clone();
+        Rc::new(move |done: Rc<dyn Fn(String)>| {
+            view.evaluate_javascript(
+                "document.documentElement.outerHTML",
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    if let Ok(v) = res {
+                        done(v.to_str().to_string());
+                    }
+                },
+            );
+        })
+    };
+
     // Ask for a path, then save to it.
     let save_as = {
         let save_to = save_to.clone();
@@ -578,7 +656,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             d.save(Some(&window), gtk::gio::Cancellable::NONE, move |res| {
                 if let Ok(f) = res {
                     if let Some(p) = f.path() {
-                        save_to(with_html_extension(p));
+                        save_to(with_html_extension(p), false);
                     }
                 }
             });
@@ -595,7 +673,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             // synchronous.
             let path = state.borrow().path.clone();
             match path {
-                Some(p) => save_to(p),
+                Some(p) => save_to(p, false),
                 None => save_as(),
             }
         })
@@ -645,8 +723,9 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     {
         let view = view.clone();
         let window = window.clone();
+        let state = state.clone();
         let say = say.clone();
-        image_b.connect_clicked(move |_| insert_picture(&window, &view, &say));
+        image_b.connect_clicked(move |_| insert_picture(&window, &view, &state, &say));
     }
 
     // The Picture menu: alignment, text wrap and scale for the picture that was right-clicked. Same
@@ -738,6 +817,12 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         sidebar.root.connect_child_revealed_notify(move |_| {
             style_b.set_active(is_open());
         });
+    }
+
+    // --- links ------------------------------------------------------------------------------------
+    {
+        let (view, window) = (view.clone(), window.clone());
+        link_b.connect_clicked(move |_| link_dialog(&window, &view));
     }
 
     // --- tables -----------------------------------------------------------------------------------
@@ -900,6 +985,56 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         }
     })));
     menu.append_section(None, &style_section);
+
+    // The two one-file forms. Both are "save a copy": neither changes what the document is, so
+    // neither takes over the title bar or the modified state.
+    let export_section = gtk::gio::Menu::new();
+    export_section.append(Some("Save a copy as one file…"), Some(&action(&window, "export-single", {
+        let (window, save_to) = (window.clone(), save_to.clone());
+        let state = state.clone();
+        move || {
+            let initial = state
+                .borrow()
+                .path
+                .as_ref()
+                .and_then(|p| p.file_stem().map(|s| format!("{}-single.html", s.to_string_lossy())))
+                .unwrap_or_else(|| "document-single.html".into());
+            let save_to = save_to.clone();
+            ask_for_path(&window, "Save a copy as one file", "HTML document", &["*.html", "*.htm"], &initial, move |p| {
+                save_to(with_extension(p, "html"), true);
+            });
+        }
+    })));
+    export_section.append(Some("Save a copy as .wgz…"), Some(&action(&window, "export-wgz", {
+        let (window, state, say) = (window.clone(), state.clone(), say.clone());
+        let read_document = read_document.clone();
+        move || {
+            let initial = state
+                .borrow()
+                .path
+                .as_ref()
+                .and_then(|p| p.file_stem().map(|s| format!("{}.wgz", s.to_string_lossy())))
+                .unwrap_or_else(|| format!("document.{}", assets::ZIP_EXTENSION));
+            let (window2, state, say, read_document) =
+                (window.clone(), state.clone(), say.clone(), read_document.clone());
+            ask_for_path(&window, "Save a copy as .wgz", "WebGen document", &["*.wgz"], &initial, move |p| {
+                let target = with_extension(p, assets::ZIP_EXTENSION);
+                let source_dir = state.borrow().path.as_ref().and_then(|d| d.parent().map(|x| x.to_path_buf()));
+                let say = say.clone();
+                let _ = &window2;
+                read_document(Rc::new(move |html: String| {
+                    match write_wgz(&target, &html, source_dir.as_deref()) {
+                        Ok(count) => say(&format!(
+                            "Saved {} — {count} file(s) inside, ready to send.",
+                            target.display()
+                        )),
+                        Err(e) => say(&format!("Could not write {}: {e}", target.display())),
+                    }
+                }));
+            });
+        }
+    })));
+    menu.append_section(None, &export_section);
     menu_b.set_menu_model(Some(&menu));
 
     // --- keyboard ---------------------------------------------------------------------------------
@@ -917,6 +1052,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let save_as = save_as.clone();
         let close_document = close_document.clone();
         let brk_click = brk.clone();
+        let link_click = link_b.clone();
         let undo_click = undo_b.clone();
         let undo_redo_b = redo_b.clone();
         keys.connect_key_pressed(move |_, key, _, modifier| {
@@ -936,6 +1072,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                 (true, false, Key::s) => save(),
                 (true, false, Key::p) => print(),
                 (true, false, Key::w) => close_document(),
+                (true, false, Key::k) => link_click.emit_clicked(),
                 (true, _, Key::Return | Key::KP_Enter) => brk_click.emit_clicked(),
                 // Tab indents, Shift+Tab outdents. In a list this is how a sub-list is made, which
                 // is the behaviour every word processor has and the reason Tab does not insert a
@@ -1012,6 +1149,262 @@ fn window_to_view(view: &webkit6::WebView, x: f64, y: f64) -> Option<(f64, f64)>
     inside.then_some((vx, vy))
 }
 
+/// Make, change or remove a link on the selection.
+///
+/// Links are the one outward reference a document is allowed to keep — a link is a reference, not
+/// an imported asset, which is why the sanitiser has always let them through. Until now there was
+/// simply no way to make one.
+fn link_dialog(window: &adw::ApplicationWindow, view: &webkit6::WebView) {
+    let window = window.clone();
+    let view = view.clone();
+    // Ask the document what is selected first, so the dialog opens on the truth: the existing href
+    // if the caret is already in a link, and the selected words if it is not.
+    view.clone().evaluate_javascript(
+        "(function () {
+           const sel = window.getSelection();
+           let node = sel && sel.anchorNode;
+           let el = node ? (node.nodeType === 1 ? node : node.parentElement) : null;
+           while (el && el.tagName !== 'A') el = el.parentElement;
+           const href = el ? (el.getAttribute('href') || '') : '';
+           const text = sel ? sel.toString() : '';
+           return href + String.fromCharCode(31) + text;
+         })()",
+        None,
+        None,
+        gtk::gio::Cancellable::NONE,
+        move |res| {
+            let record = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+            let mut parts = record.splitn(2, '\u{1f}');
+            let existing = parts.next().unwrap_or("").to_string();
+            let selected = parts.next().unwrap_or("").to_string();
+            show_link_dialog(&window, &view, existing, selected);
+        },
+    );
+}
+
+fn show_link_dialog(
+    window: &adw::ApplicationWindow,
+    view: &webkit6::WebView,
+    existing: String,
+    selected: String,
+) {
+    let dialog = adw::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title(if existing.is_empty() { "Add link" } else { "Edit link" })
+        .default_width(460)
+        .build();
+
+    let group = adw::PreferencesGroup::new();
+    group.set_description(Some(
+        "A web address, or # and a name to jump somewhere in this document.",
+    ));
+    let url = adw::EntryRow::new();
+    url.set_title("Links to");
+    url.set_text(&existing);
+    group.add(&url);
+
+    let text = adw::EntryRow::new();
+    text.set_title("Text to show");
+    text.set_text(&selected);
+    // Only offered when there is nothing selected to turn into a link.
+    if !selected.is_empty() {
+        text.set_sensitive(false);
+        text.set_tooltip_text(Some("The selected words are what the link will show"));
+    }
+    group.add(&text);
+
+    let cancel = gtk::Button::with_label("Cancel");
+    let remove = gtk::Button::with_label("Remove link");
+    remove.add_css_class("destructive-action");
+    remove.set_visible(!existing.is_empty());
+    let apply = gtk::Button::with_label(if existing.is_empty() { "Add link" } else { "Update" });
+    apply.add_css_class("suggested-action");
+
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| dialog.close());
+    }
+    {
+        let (dialog, view) = (dialog.clone(), view.clone());
+        remove.connect_clicked(move |_| {
+            view.execute_editing_command("Unlink");
+            dialog.close();
+        });
+    }
+    {
+        let (dialog, view, url, text) = (dialog.clone(), view.clone(), url.clone(), text.clone());
+        let had_selection = !selected.is_empty();
+        apply.connect_clicked(move |_| {
+            let href = url.text().trim().to_string();
+            if href.is_empty() {
+                return;
+            }
+            if had_selection {
+                view.execute_editing_command_with_argument("CreateLink", &href);
+            } else {
+                // Nothing selected: put the words in first, then link them. Without this, linking
+                // an empty selection produces a link with no text — invisible, and unclickable.
+                let label = {
+                    let typed = text.text().trim().to_string();
+                    if typed.is_empty() { href.clone() } else { typed }
+                };
+                let script = format!(
+                    "document.execCommand('insertHTML', false, {})",
+                    js::string(&format!(
+                        "<a href=\"{}\">{}</a>",
+                        doc::escape_attr(&href),
+                        doc::escape(&label)
+                    ))
+                );
+                view.evaluate_javascript(&script, None, None, gtk::gio::Cancellable::NONE, |_| {});
+            }
+            dialog.close();
+        });
+    }
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    buttons.append(&cancel);
+    buttons.append(&remove);
+    buttons.append(&apply);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(16);
+    content.set_margin_end(16);
+    content.append(&group);
+    content.append(&buttons);
+
+    let view_bar = adw::ToolbarView::new();
+    view_bar.add_top_bar(&adw::HeaderBar::new());
+    view_bar.set_content(Some(&content));
+    dialog.set_content(Some(&view_bar));
+    dialog.present();
+}
+
+/// Is this one of ours?
+fn is_wgz(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case(assets::ZIP_EXTENSION))
+        .unwrap_or(false)
+}
+
+/// Unpack a `.wgz` into a folder beside it, and return the document to open and where it went.
+///
+/// Entry names are checked rather than trusted: a zip can name a file `../../.bashrc`, and
+/// unpacking is exactly where that matters.
+fn unpack_wgz(archive: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let bytes = std::fs::read(archive).map_err(|e| e.to_string())?;
+    let entries = assets::read_zip(&bytes).map_err(|e| e.to_string())?;
+    let stem = archive
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "document".into());
+    let target = archive.with_file_name(&stem);
+    std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+
+    let mut document: Option<PathBuf> = None;
+    for (name, data) in entries {
+        let mut safe = target.clone();
+        for part in name.split('/') {
+            if part.is_empty() || part == "." || part == ".." {
+                return Err(format!("{name} is not a name this can unpack safely"));
+            }
+            safe.push(assets::sanitise_name(part));
+        }
+        if let Some(parent) = safe.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&safe, data).map_err(|e| e.to_string())?;
+        if document.is_none()
+            && safe.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("html")).unwrap_or(false)
+        {
+            document = Some(safe);
+        }
+    }
+    document.map(|d| (d, target)).ok_or_else(|| "there is no document inside it".to_string())
+}
+
+/// Ask for a path with one filter, then hand it back.
+fn ask_for_path(
+    window: &adw::ApplicationWindow,
+    title: &str,
+    filter_name: &str,
+    patterns: &[&str],
+    initial: &str,
+    done: impl Fn(PathBuf) + 'static,
+) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some(filter_name));
+    for pattern in patterns {
+        filter.add_pattern(pattern);
+    }
+    let list = gtk::gio::ListStore::new::<gtk::FileFilter>();
+    list.append(&filter);
+    let dialog = gtk::FileDialog::builder()
+        .title(title)
+        .initial_name(initial)
+        .filters(&list)
+        .build();
+    dialog.save(Some(window), gtk::gio::Cancellable::NONE, move |res| {
+        if let Ok(file) = res {
+            if let Some(path) = file.path() {
+                done(path);
+            }
+        }
+    });
+}
+
+/// Give a path the extension it needs when the user typed a bare name.
+fn with_extension(path: PathBuf, wanted: &str) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+        Some(e) if e == wanted => path,
+        _ => {
+            let mut name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "document".into());
+            name.push('.');
+            name.push_str(wanted);
+            path.with_file_name(name)
+        }
+    }
+}
+
+/// Pack a document and its assets folder into a `.wgz`.
+///
+/// The document is written out normally into a scratch folder first, so the packing uses exactly
+/// the same code the ordinary save does and cannot drift from it.
+fn write_wgz(target: &Path, html_source: &str, source_dir: Option<&Path>) -> std::io::Result<usize> {
+    let stem = target
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "document".into());
+    let scratch = std::env::temp_dir().join(format!("wgword-pack-{}-{stem}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)?;
+
+    let folder = format!("{stem}_files");
+    let policy = sanitise::AssetPolicy::Folder {
+        dir: scratch.join(&folder),
+        name: folder.clone(),
+    };
+    let (clean, _) = sanitise::clean(html_source, source_dir, &policy);
+
+    let count = assets::pack(
+        target,
+        &format!("{stem}.html"),
+        &format!("<!doctype html>\n{clean}\n"),
+        &scratch.join(&folder),
+        &folder,
+    )?;
+    let _ = std::fs::remove_dir_all(&scratch);
+    Ok(count)
+}
+
 /// Give a path an `.html` extension when the user typed a bare name. Saving `cv` and getting a file
 /// nothing associates with anything is not what was meant.
 fn with_html_extension(path: PathBuf) -> PathBuf {
@@ -1056,13 +1449,19 @@ fn error_dialog(window: &adw::ApplicationWindow, heading: &str, body: &str) {
     dlg.present();
 }
 
-/// Pick a picture and put it in the document — **embedded**, not referenced.
+/// Pick a picture and put it in the document.
 ///
-/// A document that references `/home/you/photo.jpg` breaks the moment it is emailed, and so does its
-/// PDF. Embedding is what makes "the file on disk is a standalone .html" true rather than aspirational.
+/// Where it goes depends on whether the document has anywhere to put it yet:
+///
+/// - **Saved document** — the file is copied into `<stem>_files/` under its own name, and the
+///   markup points at it. That is what makes the template workflow work: the picture is a real file
+///   called `front.png` that can be saved over from Paint without opening Word at all.
+/// - **Never saved** — there is no folder yet, so it comes in as a `data:` URI carrying its
+///   intended name in `data-wg-name`. The first save writes it out under that name.
 fn insert_picture(
     window: &adw::ApplicationWindow,
     view: &webkit6::WebView,
+    state: &Rc<RefCell<State>>,
     say: &Rc<impl Fn(&str) + 'static>,
 ) {
     let filter = gtk::FileFilter::new();
@@ -1080,15 +1479,37 @@ fn insert_picture(
         .build();
     let view = view.clone();
     let say = say.clone();
+    let state = state.clone();
     d.open(Some(window), gtk::gio::Cancellable::NONE, move |res| {
         let Ok(file) = res else { return };
-        let Some(path) = file.path() else { return };
-        // Reuse the sanitiser's own embedding, so a picture inserted here and a picture found in an
-        // opened document go through exactly the same code.
-        let markup = format!("<img src=\"{}\" class=\"wg-center\">", path.display());
-        let (clean, report) = sanitise::clean(&markup, path.parent());
+        let Some(source) = file.path() else { return };
+        let name = source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let doc = state.borrow().path.clone();
+
+        let (markup, policy) = match doc.as_ref() {
+            Some(doc_path) => (
+                format!("<img src=\"{}\" class=\"wg-center\">", doc::escape_attr(&source.display().to_string())),
+                sanitise::AssetPolicy::Folder {
+                    dir: assets::folder_path(doc_path),
+                    name: assets::folder_name(doc_path),
+                },
+            ),
+            None => (
+                format!(
+                    "<img src=\"{}\" {}=\"{}\" class=\"wg-center\">",
+                    doc::escape_attr(&source.display().to_string()),
+                    sanitise::NAME_ATTR,
+                    doc::escape_attr(&assets::sanitise_name(&name))
+                ),
+                sanitise::AssetPolicy::Embed,
+            ),
+        };
+
+        // The same code that places pictures on save places this one, so an inserted picture and
+        // one found in an opened document are treated identically.
+        let (clean, report) = sanitise::clean(&markup, source.parent(), &policy);
         if report.embedded == 0 {
-            say(&format!("{} could not be read, or is too large to embed.", path.display()));
+            say(&format!("{} could not be read, or is too large to embed.", source.display()));
             return;
         }
         view.execute_editing_command_with_argument("InsertHTML", &clean);

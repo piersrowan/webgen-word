@@ -57,6 +57,27 @@ pub struct Report {
     pub embedded: usize,
     /// Pictures that could not be embedded and were dropped.
     pub images_dropped: usize,
+    /// Pictures the document refers to that are not there. **Kept, not dropped**: the reference is
+    /// how the picture comes back when the file is restored, and in a template it is the whole
+    /// point — `front.png` is meant to be missing until somebody saves one over it.
+    pub missing: usize,
+}
+
+/// Where a document's pictures go.
+#[derive(Debug, Clone)]
+pub enum AssetPolicy {
+    /// Every local picture becomes a `data:` URI. One file, nothing beside it — the export form,
+    /// and the only thing possible for a document that has never been saved.
+    Embed,
+    /// Pictures live in a folder beside the document. The working form: readable markup, real
+    /// files with real names, and a template you can save over from Paint.
+    Folder { dir: std::path::PathBuf, name: String },
+    /// Leave local references exactly as they are; only say which ones are missing.
+    ///
+    /// This is the **load** policy. Opening a document must not rearrange somebody's files before
+    /// they have asked for anything to be saved — the copying happens on save, where the user can
+    /// see what they are agreeing to.
+    Keep,
 }
 
 impl Report {
@@ -74,6 +95,7 @@ impl Report {
             || self.controls > 0
             || self.remote > 0
             || self.images_dropped > 0
+            || self.missing > 0
     }
 
     /// A sentence for the banner. `None` when there is nothing worth saying.
@@ -104,11 +126,30 @@ impl Report {
         if self.images_dropped > 0 {
             parts.push(plural(self.images_dropped, "picture", "pictures"));
         }
-        let list = match parts.len() {
-            1 => parts[0].clone(),
-            n => format!("{} and {}", parts[..n - 1].join(", "), parts[n - 1]),
+        let removed = if parts.is_empty() {
+            None
+        } else {
+            let list = match parts.len() {
+                1 => parts[0].clone(),
+                n => format!("{} and {}", parts[..n - 1].join(", "), parts[n - 1]),
+            };
+            Some(format!(
+                "Removed {list} — this is a word processor, so documents keep text, pictures and style only."
+            ))
         };
-        Some(format!("Removed {list} — this is a word processor, so documents keep text, pictures and style only."))
+        // Missing pictures are a different kind of news: nothing was removed, something is absent.
+        let absent = (self.missing > 0).then(|| {
+            format!(
+                "{} not found — the pictures folder may not have come with this document.",
+                plural(self.missing, "picture is", "pictures are")
+            )
+        });
+        Some(match (removed, absent) {
+            (Some(r), Some(a)) => format!("{r}  {a}"),
+            (Some(r), None) => r,
+            (None, Some(a)) => a,
+            (None, None) => return None,
+        })
     }
 }
 
@@ -152,9 +193,10 @@ const FONT_EXTS: &[&str] = &["woff", "woff2", "ttf", "otf", "eot", "sfnt"];
 
 /// Clean a document. `base_dir` is the directory relative URLs resolve against — the document's own
 /// folder when it came from disk, `None` for markup with no home (a paste).
-pub fn clean(html: &str, base_dir: Option<&Path>) -> (String, Report) {
+pub fn clean(html: &str, base_dir: Option<&Path>, policy: &AssetPolicy) -> (String, Report) {
     let mut report = Report::default();
-    let out = scan(html, base_dir, &mut report);
+    let mut claimed: Vec<String> = Vec::new();
+    let out = scan(html, base_dir, policy, &mut claimed, &mut report);
     (out, report)
 }
 
@@ -183,7 +225,13 @@ pub fn find_meta(html: &str, name: &str) -> Option<String> {
 
 /// The tag scanner. Deliberately small and total: anything it does not understand is copied through
 /// verbatim rather than guessed at, because a sanitiser that mangles valid markup is its own bug.
-fn scan(html: &str, base_dir: Option<&Path>, report: &mut Report) -> String {
+fn scan(
+    html: &str,
+    base_dir: Option<&Path>,
+    policy: &AssetPolicy,
+    claimed: &mut Vec<String>,
+    report: &mut Report,
+) -> String {
     let bytes = html.as_bytes();
     let mut out = String::with_capacity(html.len());
     let mut i = 0usize;
@@ -334,7 +382,7 @@ fn scan(html: &str, base_dir: Option<&Path>, report: &mut Report) -> String {
 
         // `<img>`: the one asset a document genuinely needs. Local ones become part of the file.
         if name == "img" {
-            match embed_image(&tag, base_dir, report) {
+            match place_image(&tag, base_dir, policy, claimed, report) {
                 Some(rendered) => out.push_str(&rendered),
                 None => {}
             }
@@ -530,31 +578,105 @@ fn render_tag(tag: &Tag, report: &mut Report) -> String {
     out
 }
 
-/// Render an `<img>`, embedding its source. Returns `None` when the picture cannot be made part of
-/// the file and has to go.
-fn embed_image(tag: &Tag, base_dir: Option<&Path>, report: &mut Report) -> Option<String> {
+/// The attribute carrying a picture's intended file name between being inserted and being written
+/// out. A `data:` URI has no name of its own, and the name is the identity in the folder model.
+pub const NAME_ATTR: &str = "data-wg-name";
+
+/// Place an `<img>` according to the policy. `None` means the picture cannot be part of this
+/// document at all and has to go.
+fn place_image(
+    tag: &Tag,
+    base_dir: Option<&Path>,
+    policy: &AssetPolicy,
+    claimed: &mut Vec<String>,
+    report: &mut Report,
+) -> Option<String> {
     let src = tag.attr("src").unwrap_or_default();
     let src_trimmed = src.trim();
+    let mut drop_name_attr = false;
 
     let new_src = if src_trimmed.is_empty() {
         report.images_dropped += 1;
         return None;
-    } else if src_trimmed.starts_with("data:") {
-        // Already part of the file.
-        src.clone()
     } else if is_remote(src_trimmed) {
+        // Still cut, under either policy: a document must not reach out to the network.
         report.remote += 1;
         report.images_dropped += 1;
         return None;
     } else {
-        match read_as_data_uri(src_trimmed, base_dir) {
-            Some(uri) => {
-                report.embedded += 1;
-                uri
+        match policy {
+            AssetPolicy::Keep => {
+                if src_trimmed.starts_with("data:")
+                    || resolve(src_trimmed, base_dir).map(|p| p.is_file()).unwrap_or(false)
+                {
+                    src.clone()
+                } else {
+                    report.missing += 1;
+                    src.clone()
+                }
             }
-            None => {
-                report.images_dropped += 1;
-                return None;
+            AssetPolicy::Embed => {
+                if src_trimmed.starts_with("data:") {
+                    src.clone()
+                } else {
+                    match read_as_data_uri(src_trimmed, base_dir) {
+                        Some(uri) => {
+                            report.embedded += 1;
+                            uri
+                        }
+                        None => {
+                            // Nothing to embed. Keep the reference rather than deleting the
+                            // picture: the file may come back.
+                            report.missing += 1;
+                            src.clone()
+                        }
+                    }
+                }
+            }
+            AssetPolicy::Folder { dir, name } => {
+                if let Some(rest) = src_trimmed.strip_prefix("data:") {
+                    // A picture inserted into a document that had nowhere to put it yet. Now it
+                    // has: write the bytes out under the name it came in with.
+                    let wanted = tag
+                        .attr(NAME_ATTR)
+                        .filter(|n| !n.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            let mime = rest.split([';', ',']).next().unwrap_or("");
+                            format!("picture.{}", crate::assets::extension_for_mime(mime))
+                        });
+                    match write_data_uri(&src, &wanted, dir, claimed) {
+                        Some(file) => {
+                            drop_name_attr = true;
+                            report.embedded += 1;
+                            format!("{name}/{file}")
+                        }
+                        None => {
+                            report.images_dropped += 1;
+                            return None;
+                        }
+                    }
+                } else if src_trimmed.starts_with(&format!("{name}/")) {
+                    // Already where it belongs. Say so if the file is not actually there —
+                    // a template's `front.png` is *meant* to be missing until one is saved over it.
+                    if resolve(src_trimmed, base_dir).map(|p| p.is_file()).unwrap_or(false) {
+                        src.clone()
+                    } else {
+                        report.missing += 1;
+                        src.clone()
+                    }
+                } else {
+                    // Somewhere else on disk: copy it in and point at the copy.
+                    match copy_into(src_trimmed, base_dir, dir, claimed) {
+                        Some(file) => {
+                            report.embedded += 1;
+                            format!("{name}/{file}")
+                        }
+                        None => {
+                            report.missing += 1;
+                            src.clone()
+                        }
+                    }
+                }
             }
         }
     };
@@ -569,6 +691,9 @@ fn embed_image(tag: &Tag, base_dir: Option<&Path>, report: &mut Report) -> Optio
     };
     let mut seen_src = false;
     for (name, value, quote) in &tag.attrs {
+        if drop_name_attr && name == NAME_ATTR {
+            continue;
+        }
         if name == "src" {
             seen_src = true;
             rebuilt.attrs.push((name.clone(), new_src.clone(), if *quote == '\0' { '"' } else { *quote }));
@@ -580,6 +705,78 @@ fn embed_image(tag: &Tag, base_dir: Option<&Path>, report: &mut Report) -> Optio
         rebuilt.attrs.push(("src".into(), new_src, '"'));
     }
     Some(render_tag(&rebuilt, report))
+}
+
+/// Write a `data:` URI out as a real file in the assets folder, and return the file name used.
+fn write_data_uri(
+    uri: &str,
+    wanted: &str,
+    dir: &Path,
+    claimed: &mut Vec<String>,
+) -> Option<String> {
+    let (_, payload) = uri.split_once(',')?;
+    let bytes = if uri[..uri.find(',')?].contains(";base64") {
+        base64_decode(payload)?
+    } else {
+        percent_decode(payload).into_bytes()
+    };
+    let name = claim(wanted, dir, claimed);
+    std::fs::create_dir_all(dir).ok()?;
+    std::fs::write(dir.join(&name), bytes).ok()?;
+    Some(name)
+}
+
+/// Copy a picture from wherever it is into the assets folder, and return the file name used.
+fn copy_into(
+    url: &str,
+    base_dir: Option<&Path>,
+    dir: &Path,
+    claimed: &mut Vec<String>,
+) -> Option<String> {
+    let source = resolve(url, base_dir)?;
+    if !source.is_file() {
+        return None;
+    }
+    let wanted = source.file_name().map(|n| n.to_string_lossy().to_string())?;
+    let name = claim(&wanted, dir, claimed);
+    std::fs::create_dir_all(dir).ok()?;
+    std::fs::copy(&source, dir.join(&name)).ok()?;
+    Some(name)
+}
+
+/// Take a name in the folder, counting both what is on disk and what this pass has already used.
+fn claim(wanted: &str, dir: &Path, claimed: &mut Vec<String>) -> String {
+    let taken = |candidate: &str| claimed.iter().any(|c| c == candidate) || dir.join(candidate).exists();
+    let name = crate::assets::unique_name(wanted, &taken);
+    claimed.push(name.clone());
+    name
+}
+
+/// The inverse of [`base64`], for turning an embedded picture back into a file.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for c in text.chars() {
+        if c == '=' || c.is_whitespace() {
+            continue;
+        }
+        let value = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Read a local file and turn it into a `data:` URI. `None` if it is missing, unreadable, or too
@@ -753,7 +950,7 @@ mod tests {
     use super::*;
 
     fn clean_str(html: &str) -> (String, Report) {
-        clean(html, None)
+        clean(html, None, &AssetPolicy::Embed)
     }
 
     #[test]
@@ -861,7 +1058,7 @@ mod tests {
             0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x2c,
         ];
         std::fs::write(dir.join("pic.gif"), gif).unwrap();
-        let (out, r) = clean(r#"<img src="pic.gif" alt="a">"#, Some(&dir));
+        let (out, r) = clean(r#"<img src="pic.gif" alt="a">"#, Some(&dir), &AssetPolicy::Embed);
         assert!(out.contains("data:image/gif;base64,"), "not embedded: {out}");
         assert!(out.contains(r#"alt="a""#), "other attributes survive: {out}");
         assert_eq!(r.embedded, 1);
@@ -869,10 +1066,128 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_local_image_is_dropped_rather_than_left_broken() {
-        let (out, r) = clean(r#"<p><img src="gone.png"></p>"#, Some(Path::new("/nonexistent")));
-        assert_eq!(out, "<p></p>");
-        assert_eq!(r.images_dropped, 1);
+    fn a_missing_local_image_is_reported_rather_than_deleted() {
+        // Under the folder model a missing picture is REPORTED, not deleted: the reference is how
+        // it comes back, and in a template `front.png` is meant to be absent until one is saved
+        // over it.
+        let (out, r) = clean(
+            r#"<p><img src="gone.png"></p>"#,
+            Some(Path::new("/nonexistent")),
+            &AssetPolicy::Embed,
+        );
+        assert!(out.contains("gone.png"), "the reference survives: {out}");
+        assert_eq!(r.missing, 1);
+        assert_eq!(r.images_dropped, 0);
+    }
+
+    // ---- the folder policy -------------------------------------------------------------------
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wgword-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn gif() -> Vec<u8> {
+        vec![0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 1, 0, 1, 0, 0x80, 0, 0, 0x2c]
+    }
+
+    #[test]
+    fn an_embedded_picture_becomes_a_real_file_with_the_name_it_came_in_with() {
+        let dir = scratch("folder-name");
+        let assets = dir.join("cats_files");
+        let uri = format!("data:image/gif;base64,{}", base64(&gif()));
+        let html = format!(r#"<img src="{uri}" {NAME_ATTR}="timmy.gif" alt="a">"#);
+        let (out, r) = clean(
+            &html,
+            Some(&dir),
+            &AssetPolicy::Folder { dir: assets.clone(), name: "cats_files".into() },
+        );
+        assert!(out.contains(r#"src="cats_files/timmy.gif""#), "{out}");
+        assert!(!out.contains(NAME_ATTR), "the name attribute has done its job: {out}");
+        assert!(out.contains(r#"alt="a""#), "other attributes survive: {out}");
+        assert_eq!(std::fs::read(assets.join("timmy.gif")).unwrap(), gif());
+        assert_eq!(r.embedded, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_picture_from_elsewhere_is_copied_in_and_relinked() {
+        let dir = scratch("folder-copy");
+        let elsewhere = dir.join("Downloads");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("timmy.gif"), gif()).unwrap();
+        let html = format!(r#"<img src="{}">"#, elsewhere.join("timmy.gif").display());
+        let (out, _) = clean(
+            &html,
+            Some(&dir),
+            &AssetPolicy::Folder { dir: dir.join("cats_files"), name: "cats_files".into() },
+        );
+        assert!(out.contains(r#"src="cats_files/timmy.gif""#), "{out}");
+        assert!(dir.join("cats_files/timmy.gif").is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn four_pictures_called_icon_end_up_as_four_files() {
+        let dir = scratch("folder-collide");
+        let uri = format!("data:image/gif;base64,{}", base64(&gif()));
+        let one = format!(r#"<img src="{uri}" {NAME_ATTR}="icon.gif">"#);
+        let html = one.repeat(4);
+        let (out, _) = clean(
+            &html,
+            Some(&dir),
+            &AssetPolicy::Folder { dir: dir.join("cats_files"), name: "cats_files".into() },
+        );
+        for name in ["icon.gif", "icon-2.gif", "icon-3.gif", "icon-4.gif"] {
+            assert!(dir.join("cats_files").join(name).is_file(), "{name} missing");
+            assert!(out.contains(&format!("cats_files/{name}")), "{out}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_picture_already_in_the_folder_is_left_where_it_is() {
+        let dir = scratch("folder-keep");
+        std::fs::create_dir_all(dir.join("cats_files")).unwrap();
+        std::fs::write(dir.join("cats_files/front.png"), gif()).unwrap();
+        let (out, r) = clean(
+            r#"<img src="cats_files/front.png">"#,
+            Some(&dir),
+            &AssetPolicy::Folder { dir: dir.join("cats_files"), name: "cats_files".into() },
+        );
+        assert!(out.contains(r#"src="cats_files/front.png""#), "{out}");
+        assert_eq!(r.embedded, 0, "nothing was copied or rewritten");
+        assert_eq!(std::fs::read_dir(dir.join("cats_files")).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_templates_missing_placeholder_is_reported_and_kept() {
+        // `front.png` is MEANT to be absent until somebody saves one over it from Paint. Deleting
+        // the reference would break the template permanently.
+        let dir = scratch("folder-missing");
+        let (out, r) = clean(
+            r#"<img src="cats_files/front.png">"#,
+            Some(&dir),
+            &AssetPolicy::Folder { dir: dir.join("cats_files"), name: "cats_files".into() },
+        );
+        assert!(out.contains("cats_files/front.png"), "{out}");
+        assert_eq!(r.missing, 1);
+        assert!(r.summary().unwrap().contains("not found"), "{:?}", r.summary());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opening_a_document_moves_nobody_s_files() {
+        let dir = scratch("keep-policy");
+        std::fs::write(dir.join("timmy.gif"), gif()).unwrap();
+        let (out, r) = clean(r#"<img src="timmy.gif">"#, Some(&dir), &AssetPolicy::Keep);
+        assert!(out.contains(r#"src="timmy.gif""#), "left exactly as it was: {out}");
+        assert!(r.is_empty());
+        assert!(!dir.join("cats_files").exists(), "nothing was created on open");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
