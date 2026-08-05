@@ -86,6 +86,14 @@ pub struct Cell {
     /// `left` | `center` | `right` — empty means "whatever the CSS says".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub align: String,
+    /// Background fill as a CSS colour (`#d9d9d9`), empty for none.
+    ///
+    /// Rendered as a `.cell_rN_cM` class on the cell plus a matching rule in the scoped style
+    /// block — Piers's reserved per-cell form (2026-08-06), and NEVER an inline style: every
+    /// visual fact stays in a sheet where it can be read and overridden. Rows and columns are
+    /// numbered 1-based over the whole table's visual grid (spans resolved), head included.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fill: String,
 }
 
 fn one() -> usize {
@@ -108,6 +116,7 @@ impl Default for Cell {
             italic: false,
             underline: false,
             align: String::new(),
+            fill: String::new(),
         }
     }
 }
@@ -271,6 +280,63 @@ impl Table {
                 .join(" ");
             out.push_str(&format!("{} {{ {body} }}\n", scope(selector, &class)));
         }
+        // Per-cell fills, as `.cell_rN_cM` rules — the deviation list. Sheet rules, never inline:
+        // the point is that reading this block tells you exactly which cells differ and how.
+        let positions = self.cell_positions();
+        for (si, section) in [&self.head, &self.body, &self.foot].into_iter().enumerate() {
+            for (ri, row) in section.iter().enumerate() {
+                for (ci, cell) in row.iter().enumerate() {
+                    if cell.fill.is_empty() {
+                        continue;
+                    }
+                    if let Some(&(r, c)) = positions[si].get(ri).and_then(|cols| cols.get(ci)) {
+                        out.push_str(&format!(
+                            ".{class} .cell_r{r}_c{c} {{ background: {}; }}\n",
+                            cell.fill
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Visual `(row, col)` of every cell, 1-based, spans resolved, numbered continuously across
+    /// head → body → foot. The single source of the `.cell_rN_cM` numbering: the renderer and
+    /// [`Self::css_text`] must agree on it or the class and its rule name different cells.
+    fn cell_positions(&self) -> [Vec<Vec<(usize, usize)>>; 3] {
+        let mut occupied: Vec<Vec<bool>> = Vec::new();
+        let mut global_row = 0usize;
+        let mut out: [Vec<Vec<(usize, usize)>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (si, section) in [&self.head, &self.body, &self.foot].into_iter().enumerate() {
+            for row in section.iter() {
+                if occupied.len() <= global_row {
+                    occupied.resize(global_row + 1, Vec::new());
+                }
+                let mut cols = Vec::new();
+                let mut col = 0usize;
+                for cell in row {
+                    while occupied[global_row].get(col).copied().unwrap_or(false) {
+                        col += 1;
+                    }
+                    cols.push((global_row + 1, col + 1));
+                    for r in global_row..global_row + cell.rowspan {
+                        if occupied.len() <= r {
+                            occupied.resize(r + 1, Vec::new());
+                        }
+                        if occupied[r].len() < col + cell.colspan {
+                            occupied[r].resize(col + cell.colspan, false);
+                        }
+                        for c in col..col + cell.colspan {
+                            occupied[r][c] = true;
+                        }
+                    }
+                    col += cell.colspan;
+                }
+                out[si].push(cols);
+                global_row += 1;
+            }
+        }
         out
     }
 
@@ -290,9 +356,10 @@ impl Table {
             self.class(),
             escape_attr(&self.to_json())
         ));
-        render_section(&mut out, "thead", "th", &self.head);
-        render_section(&mut out, "tbody", "td", &self.body);
-        render_section(&mut out, "tfoot", "td", &self.foot);
+        let positions = self.cell_positions();
+        render_section(&mut out, "thead", "th", &self.head, &positions[0]);
+        render_section(&mut out, "tbody", "td", &self.body, &positions[1]);
+        render_section(&mut out, "tfoot", "td", &self.foot, &positions[2]);
         out.push_str("</table>\n");
         out.push_str(END_MARKER);
         out.push('\n');
@@ -318,14 +385,20 @@ fn scope(selector: &str, class: &str) -> String {
     }
 }
 
-fn render_section(out: &mut String, section: &str, cell_tag: &str, rows: &[Vec<Cell>]) {
+fn render_section(
+    out: &mut String,
+    section: &str,
+    cell_tag: &str,
+    rows: &[Vec<Cell>],
+    positions: &[Vec<(usize, usize)>],
+) {
     if rows.is_empty() {
         return;
     }
     out.push_str(&format!("  <{section}>\n"));
-    for row in rows {
+    for (ri, row) in rows.iter().enumerate() {
         out.push_str("    <tr>\n");
-        for cell in row {
+        for (ci, cell) in row.iter().enumerate() {
             let mut attrs = String::new();
             if cell.colspan > 1 {
                 attrs.push_str(&format!(" colspan=\"{}\"", cell.colspan));
@@ -333,8 +406,18 @@ fn render_section(out: &mut String, section: &str, cell_tag: &str, rows: &[Vec<C
             if cell.rowspan > 1 {
                 attrs.push_str(&format!(" rowspan=\"{}\"", cell.rowspan));
             }
+            // Classes accumulate: alignment and the per-cell fill hook may coexist.
+            let mut classes: Vec<String> = Vec::new();
             if !cell.align.is_empty() {
-                attrs.push_str(&format!(" class=\"wg-a-{}\"", cell.align));
+                classes.push(format!("wg-a-{}", cell.align));
+            }
+            if !cell.fill.is_empty() {
+                if let Some(&(r, c)) = positions.get(ri).and_then(|cols| cols.get(ci)) {
+                    classes.push(format!("cell_r{r}_c{c}"));
+                }
+            }
+            if !classes.is_empty() {
+                attrs.push_str(&format!(" class=\"{}\"", classes.join(" ")));
             }
             let mut text = escape(&cell.text);
             if text.is_empty() {
@@ -887,5 +970,33 @@ mod tests {
         assert_eq!(table.head[0].len(), 3);
         assert_eq!(table.body[0].len(), 3);
         assert_eq!(table.foot[0].len(), 3);
+    }
+
+    #[test]
+    fn a_filled_cell_gets_a_cell_class_and_a_sheet_rule_never_an_inline_style() {
+        let mut table = t(2, 2);
+        table.body[1][1].fill = "#d9d9d9".into();
+        let block = table.to_block();
+        // Head row is row 1, so body row 2 is visual row 3; second column is c2.
+        assert!(block.contains("class=\"cell_r3_c2\""), "{block}");
+        assert!(block.contains(&format!(".{} .cell_r3_c2 {{ background: #d9d9d9; }}", table.class())), "{block}");
+        assert!(!block.contains("style=\""), "no inline styles ever: {block}");
+        // And it survives the JSON round trip that regeneration relies on.
+        let back = Table::from_json(&table.to_json()).unwrap();
+        assert_eq!(back.body[1][1].fill, "#d9d9d9");
+    }
+
+    #[test]
+    fn fill_numbering_respects_spans_above_and_beside() {
+        // Body-only table: r1c1 spans 2 rows, so the second row's first LISTED cell sits at c2;
+        // give it a fill and the class must say r2_c2, not r2_c1.
+        let mut table = Table { id: 9, head: Vec::new(), body: vec![
+            vec![Cell { rowspan: 2, ..Cell::with_text("tall") }, Cell::with_text("a")],
+            vec![Cell { fill: "#eee".into(), ..Cell::with_text("shifted") }],
+        ], foot: Vec::new(), css: Default::default() };
+        table.css.clear();
+        let block = table.to_block();
+        assert!(block.contains("class=\"cell_r2_c2\""), "{block}");
+        assert!(block.contains(".wg-t9 .cell_r2_c2 { background: #eee; }"), "{block}");
     }
 }

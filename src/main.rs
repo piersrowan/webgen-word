@@ -318,12 +318,16 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     }
 
     // --- document load -------------------------------------------------------------------------
-    let load_into = {
+    // A slot holding load_into itself, so the .docx convert dialog's callback can re-enter the
+    // load with the html it produced. Filled right after the closure exists.
+    let load_self: Rc<RefCell<Option<Rc<dyn Fn(Option<PathBuf>)>>>> = Rc::new(RefCell::new(None));
+    let load_into: Rc<dyn Fn(Option<PathBuf>)> = {
         let view = view.clone();
         let window = window.clone();
         let state = state.clone();
         let settings = settings.clone();
         let say = say.clone();
+        let load_self = load_self.clone();
         Rc::new(move |path: Option<PathBuf>| {
             let base = Base::from_settings(&settings);
             // A `.wgz` is unpacked beside itself and the document inside is what actually opens.
@@ -342,22 +346,51 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                     }
                 },
                 // A .docx converts to html-plus-folder beside itself and THAT opens — same deal
-                // as the .wgz above. The original .docx is never modified.
-                Some(p) if is_docx(&p) => match convert_docx(&p) {
-                    Ok((doc, pictures)) => {
-                        let extra = if pictures > 0 {
-                            format!(" (+{pictures} picture{})", if pictures == 1 { "" } else { "s" })
-                        } else {
-                            String::new()
-                        };
-                        say(&format!("Converted to {}{extra} — editing the HTML copy.", doc.display()));
-                        Some(doc)
-                    }
-                    Err(e) => {
-                        say(&format!("Could not open {}: {e}", p.display()));
-                        None
-                    }
-                },
+                // as the .wgz above. The original .docx is never modified. HOW its styling comes
+                // across is the user's call (Piers's three modes), so a dialog asks first and the
+                // conversion happens in its response; this invocation ends here.
+                Some(p) if is_docx(&p) => {
+                    let dlg = adw::MessageDialog::new(
+                        Some(&window),
+                        Some("Convert Word document"),
+                        Some("How should its styling come across?"),
+                    );
+                    // NB stacked responses render in reverse order (see confirm_if_modified).
+                    dlg.add_response("cancel", "Cancel");
+                    dlg.add_response("plain", "Plain");
+                    dlg.add_response("system", "System style");
+                    dlg.add_response("document", "Document formatting");
+                    let last = settings.string("docx_convert_mode", "document");
+                    dlg.set_default_response(Some(&last));
+                    dlg.set_close_response("cancel");
+                    let settings = settings.clone();
+                    let say = say.clone();
+                    let again = load_self.clone();
+                    dlg.connect_response(None, move |dlg, resp| {
+                        dlg.close();
+                        if resp == "cancel" {
+                            return;
+                        }
+                        let mode = ConvertMode::from_key(resp);
+                        settings.set_string("docx_convert_mode", mode.key());
+                        match convert_docx(&p, mode) {
+                            Ok((doc, pictures)) => {
+                                let extra = if pictures > 0 {
+                                    format!(" (+{pictures} picture{})", if pictures == 1 { "" } else { "s" })
+                                } else {
+                                    String::new()
+                                };
+                                say(&format!("Converted to {}{extra} — editing the HTML copy.", doc.display()));
+                                if let Some(f) = again.borrow().as_ref() {
+                                    f(Some(doc));
+                                }
+                            }
+                            Err(e) => say(&format!("Could not open {}: {e}", p.display())),
+                        }
+                    });
+                    dlg.present();
+                    return;
+                }
                 other => other,
             };
             let bytes = path.as_ref().map(|p| (p.clone(), std::fs::read(p)));
@@ -419,6 +452,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             }
         })
     };
+    *load_self.borrow_mut() = Some(load_into.clone());
 
     // Re-baseline whenever a document finishes loading. Registered BEFORE the first load so the
     // initial document is baselined too -- `load_html` is asynchronous, the signal arrives later.
@@ -1353,13 +1387,90 @@ fn is_docx(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// How a `.docx` conversion treats the source document's visual styling.
+#[derive(Clone, Copy, PartialEq)]
+enum ConvertMode {
+    /// Honour the source: its borders, its cell shading — mapped into scoped sheet rules.
+    Document,
+    /// Ignore the source's look; give every table Word's own chrome.
+    System,
+    /// Structure only: no borders, no shading. What the sanitiser would leave of a bare paste.
+    Plain,
+}
+
+impl ConvertMode {
+    fn key(self) -> &'static str {
+        match self {
+            ConvertMode::Document => "document",
+            ConvertMode::System => "system",
+            ConvertMode::Plain => "plain",
+        }
+    }
+    fn from_key(s: &str) -> ConvertMode {
+        match s {
+            "system" => ConvertMode::System,
+            "plain" => ConvertMode::Plain,
+            _ => ConvertMode::Document,
+        }
+    }
+}
+
+/// Map a converter table into a native table block when every cell is simple enough to adopt
+/// losslessly. A native block is the prize: the table window and the CSS panel both work on it.
+fn native_table(t: &webgen_convert::DocTable, id: u32, mode: ConvertMode) -> Option<table::Table> {
+    let mut rows: Vec<Vec<table::Cell>> = Vec::new();
+    for row in &t.rows {
+        let mut cells = Vec::new();
+        for c in row {
+            let (text, bold) = c.simple.clone()?;
+            cells.push(table::Cell {
+                text,
+                bold,
+                colspan: c.colspan as usize,
+                rowspan: c.rowspan as usize,
+                fill: match mode {
+                    ConvertMode::Document => c.fill.clone().unwrap_or_default(),
+                    _ => String::new(),
+                },
+                ..Default::default()
+            });
+        }
+        rows.push(cells);
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let head = vec![rows.remove(0)];
+    let mut css = std::collections::BTreeMap::new();
+    let bordered = match mode {
+        ConvertMode::Document => t.bordered,
+        ConvertMode::System => true,
+        ConvertMode::Plain => false,
+    };
+    if bordered {
+        // 1px black across both bordered modes, matching what render_table_html gives the
+        // complex tables — one document, one look. (User-created tables keep Table::new's
+        // softer grey; a converted form is imitating paper, not the app.)
+        let cell = crate::docstyle::TagStyle {
+            border: "1px solid #000000".into(),
+            padding: "6px".into(),
+            ..Default::default()
+        };
+        css.insert("th".to_string(), crate::docstyle::TagStyle { font_weight: "bold".into(), ..cell.clone() });
+        css.insert("td".to_string(), cell);
+    }
+    Some(table::Table { id, head, body: rows, foot: Vec::new(), css })
+}
+
 /// Convert a `.docx` into `stem.html` + `stem_files/` beside it and hand back the html to open.
 ///
 /// Same shape as the `.wgz` unpack above and for the same reason: the working form is markup plus
 /// a folder, so a foreign format's job is to BECOME that form, once, next to itself — after which
 /// the ordinary open path (sanitiser included) treats it like any HTML it does not trust yet.
+/// Tables whose cells are simple become NATIVE table blocks (editable in the table window, styled
+/// through the CSS panel); the rest keep semantic markup with the same scoped-sheet conventions.
 /// Returns the html path and how many pictures were extracted.
-fn convert_docx(archive: &Path) -> Result<(PathBuf, usize), String> {
+fn convert_docx(archive: &Path, mode: ConvertMode) -> Result<(PathBuf, usize), String> {
     let bytes = std::fs::read(archive).map_err(|e| e.to_string())?;
     let stem = archive
         .file_stem()
@@ -1373,7 +1484,35 @@ fn convert_docx(archive: &Path) -> Result<(PathBuf, usize), String> {
         target = archive.with_file_name(format!("{stem}-{n}.html"));
     }
     let folder = assets::folder_name(&target);
-    let out = webgen_convert::docx_to_html(&bytes, &folder).map_err(|e| e.to_string())?;
+    let out = webgen_convert::docx_to_segments(&bytes, &folder).map_err(|e| e.to_string())?;
+
+    let mut body = String::new();
+    let mut native_id = 0u32;
+    for seg in out.segments {
+        match seg {
+            webgen_convert::Segment::Html(h) => body.push_str(&h),
+            webgen_convert::Segment::Table(mut t) => {
+                if let Some(native) = native_table(&t, native_id + 1, mode) {
+                    native_id += 1;
+                    body.push_str(&native.to_block());
+                } else {
+                    match mode {
+                        ConvertMode::Document => {}
+                        ConvertMode::System => t.bordered = true,
+                        ConvertMode::Plain => {
+                            t.bordered = false;
+                            for row in &mut t.rows {
+                                for c in row {
+                                    c.fill = None;
+                                }
+                            }
+                        }
+                    }
+                    body.push_str(&webgen_convert::render_table_html(&t));
+                }
+            }
+        }
+    }
 
     if !out.assets.is_empty() {
         let adir = assets::folder_path(&target);
@@ -1389,7 +1528,7 @@ fn convert_docx(archive: &Path) -> Result<(PathBuf, usize), String> {
     let html = format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n{}\n</body></html>\n",
         doc::escape(&stem),
-        out.body_html
+        body
     );
     std::fs::write(&target, html).map_err(|e| e.to_string())?;
     Ok((target, out.assets.len()))

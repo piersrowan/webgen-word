@@ -180,9 +180,16 @@ const URL_ATTRS: &[&str] = &[
     "xlink:href", "ping", "srcdoc", "srcset",
 ];
 
-/// Attributes dropped outright wherever they appear: they either import an asset we do not allow or
-/// exist only to drive script.
-const DROP_ATTRS: &[&str] = &["srcdoc", "srcset", "ping", "formaction", "background", "longdesc"];
+/// Attributes dropped outright wherever they appear: they either import an asset we do not allow,
+/// exist only to drive script — or, for `style`, violate the document's one styling rule.
+///
+/// **`style` is the no-inline invariant** (Piers, 2026-08-06): every visual fact lives in a
+/// stylesheet — the document's own, or a table block's scoped one — where what was altered for
+/// what outcome can actually be read. Inline styles make that unknowable, so they are not merely
+/// discouraged, they are structurally impossible: anything a paste or a converter brings in is
+/// stripped here, on load and again on save.
+const DROP_ATTRS: &[&str] =
+    &["srcdoc", "srcset", "ping", "formaction", "background", "longdesc", "style"];
 
 /// The largest single asset that will be embedded. A document is meant to be mailable; a 50 MB
 /// picture inlined as base64 becomes a 67 MB file that nothing will accept.
@@ -1231,6 +1238,20 @@ mod tests {
         let (out, _) = clean_str("<td colspan=2 nowrap><img src=data:image/gif;base64,AA></td>");
         assert!(out.contains("colspan=\"2\""), "{out}");
         assert!(out.contains("nowrap"), "{out}");
+    }
+
+    #[test]
+    fn inline_style_attributes_are_stripped_everywhere() {
+        // The no-inline invariant: styling lives in sheets, full stop. Pasted markup, converter
+        // output and hand-edited files all pass through here, so `style=` dies here.
+        let (out, _) = clean_str(
+            r#"<p style="color:red">a</p><table style="border:1px"><tr><td style="background:#eee" colspan="2">b</td></tr></table>"#,
+        );
+        assert!(!out.contains("style="), "{out}");
+        assert!(out.contains("colspan=\"2\""), "the neighbours survive: {out}");
+        // The sheet route stays open — that is the point.
+        let (kept, _) = clean_str("<style>td { background: #eee; }</style><p>c</p>");
+        assert!(kept.contains("background: #eee"), "{kept}");
     }
 
     #[test]

@@ -13,7 +13,46 @@
 
 mod docx;
 
-pub use docx::docx_to_html;
+pub use docx::{docx_to_html, docx_to_segments, render_table_html};
+
+/// One block-level piece of a converted document, in order. Consumers that only want markup can
+/// use [`docx_to_html`]; a consumer with its own table machinery (webgen-word's JSON-model table
+/// blocks) takes segments and decides per table whether to adopt it natively.
+pub enum Segment {
+    Html(String),
+    Table(DocTable),
+}
+
+/// A table as the source document meant it: spans resolved, merge-continuation cells removed,
+/// visual styling carried as DATA (never inline CSS — the consumer turns it into sheet rules).
+pub struct DocTable {
+    /// Unique per conversion (nested tables included) — the `wg-conv-tN` scope id, so a consumer
+    /// rendering some tables itself can never collide with ones the converter rendered inline.
+    pub seq: u32,
+    pub rows: Vec<Vec<DocCell>>,
+    /// The source declared visible borders (docx `tblBorders` with any non-nil edge).
+    pub bordered: bool,
+}
+
+/// What [`docx_to_segments`] produces.
+pub struct ConvertedSegments {
+    pub segments: Vec<Segment>,
+    pub assets: Vec<(String, Vec<u8>)>,
+    pub notes: Vec<String>,
+}
+
+pub struct DocCell {
+    /// The cell's content as sanitisable HTML (paragraphs, lists, nested tables…).
+    pub html: String,
+    /// `Some((text, bold))` when the content is exactly one plain paragraph — at most wholly
+    /// bold — so a model-based consumer can adopt the cell losslessly. `None` means "complex";
+    /// keep the html.
+    pub simple: Option<(String, bool)>,
+    pub colspan: u32,
+    pub rowspan: u32,
+    /// Background fill as `#rrggbb`, from docx `w:shd w:fill` (never "auto").
+    pub fill: Option<String>,
+}
 
 /// What a conversion produces.
 #[derive(Debug)]

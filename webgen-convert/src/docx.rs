@@ -7,13 +7,28 @@
 //! table-heavy assessment forms: tables with gridSpan/vMerge merges dominate, headings and
 //! style-carried bullets follow, images are rare. That ordering is why tables get the most care.
 
-use crate::Converted;
+use crate::{Converted, ConvertedSegments, DocCell, DocTable, Segment};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::collections::HashMap;
 use std::io::Read;
 
 pub fn docx_to_html(docx: &[u8], asset_dir: &str) -> Result<Converted, String> {
+    let out = docx_to_segments(docx, asset_dir)?;
+    let body_html = out
+        .segments
+        .into_iter()
+        .map(|s| match s {
+            Segment::Html(h) => h,
+            Segment::Table(t) => render_table_html(&t),
+        })
+        .collect::<String>();
+    Ok(Converted { body_html, assets: out.assets, notes: out.notes })
+}
+
+/// Like [`docx_to_html`], but top-level tables come back as structure so a consumer with its own
+/// table machinery can adopt them natively. Nested tables (inside cells) are always rendered.
+pub fn docx_to_segments(docx: &[u8], asset_dir: &str) -> Result<ConvertedSegments, String> {
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(docx))
         .map_err(|e| format!("not a readable zip: {e}"))?;
 
@@ -43,11 +58,32 @@ pub fn docx_to_html(docx: &[u8], asset_dir: &str) -> Result<Converted, String> {
         assets: Vec::new(),
         notes: Vec::new(),
         in_field_instruction: false,
+        table_seq: 0,
     };
 
-    let body_html = p.parse_document(&document)?;
-    Ok(Converted {
-        body_html,
+    let blocks = p.parse_document(&document)?;
+
+    // Fold into segments: maximal runs of paragraphs render together (list nesting spans
+    // paragraphs, so they must be rendered as one run), top-level tables stay structural.
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut run: Vec<Block> = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Table(t) => {
+                if !run.is_empty() {
+                    segments.push(Segment::Html(render_blocks(std::mem::take(&mut run))));
+                }
+                segments.push(Segment::Table(t));
+            }
+            other => run.push(other),
+        }
+    }
+    if !run.is_empty() {
+        segments.push(Segment::Html(render_blocks(run)));
+    }
+
+    Ok(ConvertedSegments {
+        segments,
         assets: p.assets,
         notes: p.notes,
     })
@@ -282,6 +318,8 @@ struct Parser {
     /// Between a field's "begin" and its "separate", runs carry the field INSTRUCTION
     /// (`TOC \o "1-3"`, `HYPERLINK "…"`), not content. Those must not leak into the text.
     in_field_instruction: bool,
+    /// Monotonic table id across the whole conversion (nested included) — the `wg-conv-tN` scope.
+    table_seq: u32,
 }
 
 /// One block-level thing inside a body or a table cell.
@@ -291,16 +329,15 @@ enum Block {
         inner: String,
         num: Option<(bool, u32)>,   // (ordered, ilvl) when the paragraph is a list item
     },
-    Html(String),                    // a finished table
+    Table(DocTable),
 }
 
 impl Parser {
-    fn parse_document(&mut self, xml: &[u8]) -> Result<String, String> {
+    fn parse_document(&mut self, xml: &[u8]) -> Result<Vec<Block>, String> {
         let mut r = Reader::from_reader(xml);
         r.config_mut().trim_text(false);
         let mut buf = Vec::new();
-        let blocks = self.parse_blocks(&mut r, &mut buf, b"body")?;
-        Ok(render_blocks(blocks))
+        self.parse_blocks(&mut r, &mut buf, b"body")
     }
 
     /// Consume block-level content until `</w:{end}>`, returning the blocks in order. Recurses
@@ -321,8 +358,8 @@ impl Parser {
                         out.push(b);
                     }
                     b"tbl" => {
-                        let html = self.parse_table(r)?;
-                        out.push(Block::Html(html));
+                        let table = self.parse_table(r)?;
+                        out.push(Block::Table(table));
                     }
                     _ => {}
                 },
@@ -533,56 +570,77 @@ impl Parser {
         unreachable!()
     }
 
-    /// `<w:tbl>` … `</w:tbl>` — buffered, because vMerge rowspans cannot be emitted streaming:
-    /// the cell that grows is ABOVE the cells that vanish.
-    fn parse_table(&mut self, r: &mut Reader<&[u8]>) -> Result<String, String> {
-        struct Cell {
-            html: String,
-            colspan: u32,
+    /// `<w:tbl>` … `</w:tbl>` — buffered, because vMerge rowspans cannot be resolved streaming:
+    /// the cell that grows is ABOVE the cells that vanish. Returns structure, not markup; the
+    /// caller decides how (and whether) to render it.
+    fn parse_table(&mut self, r: &mut Reader<&[u8]>) -> Result<DocTable, String> {
+        struct Raw {
+            cell: DocCell,
             vmerge: Option<bool>, // Some(true)=restart, Some(false)=continue
-            rowspan: u32,
         }
-        let mut rows: Vec<Vec<Cell>> = Vec::new();
+        let mut rows: Vec<Vec<Raw>> = Vec::new();
+        let mut bordered = false;
+        let mut in_tbl_borders = false;
         let mut buf = Vec::new();
         loop {
             let ev = r.read_event_into(&mut buf).map_err(|e| e.to_string())?;
             match ev {
-                Event::Start(ref e) => match local_name(e.name().as_ref()) {
-                    b"tr" => rows.push(Vec::new()),
-                    b"tc" => {
-                        let (html, colspan, vmerge) = self.parse_cell(r)?;
-                        rows.last_mut()
-                            .ok_or("a table cell outside any row")?
-                            .push(Cell { html, colspan, vmerge, rowspan: 1 });
+                Event::Start(ref e) | Event::Empty(ref e) => {
+                    let name = local_name(e.name().as_ref()).to_vec();
+                    let is_start = matches!(ev, Event::Start(_));
+                    match name.as_slice() {
+                        b"tr" if is_start => rows.push(Vec::new()),
+                        b"tc" if is_start => {
+                            let (cell, vmerge) = self.parse_cell(r)?;
+                            rows.last_mut()
+                                .ok_or("a table cell outside any row")?
+                                .push(Raw { cell, vmerge });
+                        }
+                        b"tbl" if is_start => {
+                            // Stray nested table outside a cell — malformed; consume and drop.
+                            let _ = self.parse_table(r)?;
+                        }
+                        // Table-level borders live in tblPr > tblBorders; the same edge elements
+                        // also exist per-cell in tcBorders, but those are consumed inside
+                        // parse_cell and never reach this loop.
+                        b"tblBorders" => in_tbl_borders = is_start,
+                        b"top" | b"bottom" | b"left" | b"right" | b"insideH" | b"insideV"
+                            if in_tbl_borders =>
+                        {
+                            let val = attr(e, "val").unwrap_or_default();
+                            if !val.is_empty() && val != "none" && val != "nil" {
+                                bordered = true;
+                            }
+                        }
+                        _ => {}
                     }
-                    b"tbl" => {
-                        // A nested table before any cell would be malformed; inside cells it is
-                        // handled by parse_cell. Reaching here means stray markup — skip it.
-                        let _ = self.parse_table(r)?;
-                    }
+                }
+                Event::End(e) => match local_name(e.name().as_ref()) {
+                    b"tbl" => break,
+                    b"tblBorders" => in_tbl_borders = false,
                     _ => {}
                 },
-                Event::End(e) if local_name(e.name().as_ref()) == b"tbl" => break,
                 Event::Eof => break,
                 _ => {}
             }
             buf.clear();
         }
 
-        // Resolve vMerge into rowspans. Column positions are tracked with colspans so a merge in
-        // a ragged form lines up with the right upstairs cell.
+        // Resolve vMerge into rowspans, then DROP the continuation cells: a DocTable's rows are
+        // what a renderer emits, not what the wire format said. Column positions are tracked with
+        // colspans so a merge in a ragged form lines up with the right upstairs cell.
         let mut open: HashMap<u32, (usize, usize)> = HashMap::new(); // col -> (row, cell)
         for ri in 0..rows.len() {
             let mut col = 0u32;
             for ci in 0..rows[ri].len() {
-                let (span, merge) = (rows[ri][ci].colspan, rows[ri][ci].vmerge);
+                let (span, merge) = (rows[ri][ci].cell.colspan, rows[ri][ci].vmerge);
                 match merge {
                     Some(true) => {
                         open.insert(col, (ri, ci));
                     }
                     Some(false) => {
                         if let Some(&(orow, ocell)) = open.get(&col) {
-                            rows[orow][ocell].rowspan += 1;
+                            rows[orow][ocell].cell.rowspan += 1;
                         }
                     }
                     None => {
@@ -592,74 +650,100 @@ impl Parser {
                 col += span;
             }
         }
+        let rows: Vec<Vec<DocCell>> = rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .filter(|raw| raw.vmerge != Some(false))
+                    .map(|raw| raw.cell)
+                    .collect()
+            })
+            .collect();
 
-        let mut html = String::from("<table>");
-        for (ri, row) in rows.iter().enumerate() {
-            html.push_str("<tr>");
-            for cell in row {
-                if cell.vmerge == Some(false) {
-                    continue; // swallowed by the rowspan above it
-                }
-                // First row as headers: the corpus is assessment forms, where it holds. A wrong
-                // th renders bold-centred — a visible nudge, not data loss.
-                let tag = if ri == 0 { "th" } else { "td" };
-                let mut attrs = String::new();
-                if cell.colspan > 1 {
-                    attrs.push_str(&format!(" colspan=\"{}\"", cell.colspan));
-                }
-                if cell.rowspan > 1 {
-                    attrs.push_str(&format!(" rowspan=\"{}\"", cell.rowspan));
-                }
-                html.push_str(&format!("<{tag}{attrs}>{}</{tag}>", cell.html));
-            }
-            html.push_str("</tr>");
-        }
-        html.push_str("</table>");
-        Ok(html)
+        self.table_seq += 1;
+        Ok(DocTable { seq: self.table_seq, rows, bordered })
     }
 
-    /// One `<w:tc>` … `</w:tc>`: harvest the props (gridSpan/vMerge live inside `<w:tcPr>`,
+    /// One `<w:tc>` … `</w:tc>`: harvest the props (gridSpan/vMerge/shd live inside `<w:tcPr>`,
     /// always before any content) and parse the block content in the same loop — no peeking,
     /// and a cell WITHOUT a tcPr loses nothing.
-    fn parse_cell(&mut self, r: &mut Reader<&[u8]>) -> Result<(String, u32, Option<bool>), String> {
+    fn parse_cell(&mut self, r: &mut Reader<&[u8]>) -> Result<(DocCell, Option<bool>), String> {
         let mut buf = Vec::new();
         let mut colspan = 1u32;
         let mut vmerge: Option<bool> = None;
+        let mut fill: Option<String> = None;
         let mut blocks: Vec<Block> = Vec::new();
         loop {
             let ev = r.read_event_into(&mut buf).map_err(|e| e.to_string())?;
             match ev {
-                Event::Start(ref e) => match local_name(e.name().as_ref()) {
-                    b"p" => {
-                        let b = self.parse_paragraph(r)?;
-                        blocks.push(b);
+                Event::Start(ref e) | Event::Empty(ref e) => {
+                    let name = local_name(e.name().as_ref()).to_vec();
+                    let is_start = matches!(ev, Event::Start(_));
+                    match name.as_slice() {
+                        b"p" if is_start => {
+                            let b = self.parse_paragraph(r)?;
+                            blocks.push(b);
+                        }
+                        b"tbl" if is_start => {
+                            let table = self.parse_table(r)?;
+                            blocks.push(Block::Table(table));
+                        }
+                        b"gridSpan" => {
+                            colspan = attr(e, "val").and_then(|v| v.parse().ok()).unwrap_or(1)
+                        }
+                        b"vMerge" => {
+                            vmerge = Some(attr(e, "val").as_deref() == Some("restart"))
+                        }
+                        // Cell shading. "auto" means "no opinion", not a colour.
+                        b"shd" => {
+                            if let Some(hex) = attr(e, "fill")
+                                .filter(|v| v.len() == 6 && v != "auto")
+                                .filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))
+                            {
+                                fill = Some(format!("#{}", hex.to_ascii_lowercase()));
+                            }
+                        }
+                        _ => {}
                     }
-                    b"tbl" => {
-                        let html = self.parse_table(r)?;
-                        blocks.push(Block::Html(html));
-                    }
-                    // Some producers write the props as non-empty elements.
-                    b"gridSpan" => {
-                        colspan = attr(e, "val").and_then(|v| v.parse().ok()).unwrap_or(1)
-                    }
-                    b"vMerge" => vmerge = Some(attr(e, "val").as_deref() == Some("restart")),
-                    _ => {}
-                },
-                Event::Empty(ref e) => match local_name(e.name().as_ref()) {
-                    b"gridSpan" => {
-                        colspan = attr(e, "val").and_then(|v| v.parse().ok()).unwrap_or(1)
-                    }
-                    b"vMerge" => vmerge = Some(attr(e, "val").as_deref() == Some("restart")),
-                    _ => {}
-                },
+                }
                 Event::End(e) if local_name(e.name().as_ref()) == b"tc" => break,
                 Event::Eof => break,
                 _ => {}
             }
             buf.clear();
         }
-        Ok((render_blocks(blocks), colspan, vmerge))
+
+        // A cell is "simple" when a model-based consumer can adopt it losslessly: exactly one
+        // plain paragraph, at most wholly bold. Everything else keeps its html.
+        let simple = match blocks.as_slice() {
+            [Block::Para { tag: "p", inner, num: None }] => simple_text_of(inner),
+            _ => None,
+        };
+        let html = render_blocks(blocks);
+        Ok((DocCell { html, simple, colspan, rowspan: 1, fill }, vmerge))
     }
+}
+
+/// `Some((text, bold))` when the paragraph inner is plain text, or plain text wholly wrapped in
+/// `<strong>`. The text comes back UNescaped — a model consumer stores raw text and re-escapes on
+/// its own way out.
+fn simple_text_of(inner: &str) -> Option<(String, bool)> {
+    let (body, bold) = match inner
+        .strip_prefix("<strong>")
+        .and_then(|rest| rest.strip_suffix("</strong>"))
+    {
+        Some(mid) => (mid, true),
+        None => (inner, false),
+    };
+    if body.contains('<') {
+        return None;
+    }
+    Some((unescape(body), bold))
+}
+
+/// Reverse of [`escape`] — only the three entities escape() writes.
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
 // ---- run formatting ---------------------------------------------------------------------------
@@ -752,14 +836,96 @@ fn render_blocks(blocks: Vec<Block>) -> String {
                     }
                 }
             },
-            Block::Html(h) => {
+            Block::Table(t) => {
                 close_to(&mut out, &mut stack, 0);
-                out.push_str(&h);
+                out.push_str(&render_table_html(&t));
             }
         }
     }
     close_to(&mut out, &mut stack, 0);
     out
+}
+
+/// Render a [`DocTable`] as markup plus a scoped style block — the "tier 2" form, for consumers
+/// without their own table model (and for nested tables, which always take this form).
+///
+/// Styling is sheet rules scoped to `wg-conv-tN`, NEVER inline: borders when the source declared
+/// them, per-cell fills as `.cell_rN_cM` rules (1-based visual grid, spans resolved) — the same
+/// naming webgen-word's native table blocks use, so the CSS panel vocabulary is one vocabulary.
+pub fn render_table_html(t: &DocTable) -> String {
+    let class = format!("wg-conv-t{}", t.seq);
+
+    // Visual (row, col) per cell, spans resolved — mirrors the source layout.
+    let mut occupied: Vec<Vec<bool>> = Vec::new();
+    let mut positions: Vec<Vec<(usize, usize)>> = Vec::new();
+    for (ri, row) in t.rows.iter().enumerate() {
+        if occupied.len() <= ri {
+            occupied.resize(ri + 1, Vec::new());
+        }
+        let mut cols = Vec::new();
+        let mut col = 0usize;
+        for cell in row {
+            while occupied[ri].get(col).copied().unwrap_or(false) {
+                col += 1;
+            }
+            cols.push((ri + 1, col + 1));
+            for r in ri..ri + cell.rowspan as usize {
+                if occupied.len() <= r {
+                    occupied.resize(r + 1, Vec::new());
+                }
+                let end = col + cell.colspan as usize;
+                if occupied[r].len() < end {
+                    occupied[r].resize(end, false);
+                }
+                for c in col..end {
+                    occupied[r][c] = true;
+                }
+            }
+            col += cell.colspan as usize;
+        }
+        positions.push(cols);
+    }
+
+    let mut css = format!("table.{class} {{ border-collapse: collapse; }}\n");
+    if t.bordered {
+        css.push_str(&format!(
+            "table.{class}, .{class} th, .{class} td {{ border: 1px solid #000000; }}\n"
+        ));
+        css.push_str(&format!(".{class} th, .{class} td {{ padding: 4px 6px; }}\n"));
+    }
+    for (ri, row) in t.rows.iter().enumerate() {
+        for (ci, cell) in row.iter().enumerate() {
+            if let Some(fill) = &cell.fill {
+                let (r, c) = positions[ri][ci];
+                css.push_str(&format!(".{class} .cell_r{r}_c{c} {{ background: {fill}; }}\n"));
+            }
+        }
+    }
+
+    let mut html = format!("<style>\n{css}</style>\n<table class=\"{class}\">");
+    for (ri, row) in t.rows.iter().enumerate() {
+        html.push_str("<tr>");
+        for (ci, cell) in row.iter().enumerate() {
+            // First row as headers: the corpus is assessment forms, where it holds. A wrong th
+            // renders bold — a visible nudge, not data loss.
+            let tag = if ri == 0 { "th" } else { "td" };
+            let mut attrs = String::new();
+            if cell.colspan > 1 {
+                attrs.push_str(&format!(" colspan=\"{}\"", cell.colspan));
+            }
+            if cell.rowspan > 1 {
+                attrs.push_str(&format!(" rowspan=\"{}\"", cell.rowspan));
+            }
+            if cell.fill.is_some() {
+                let (r, c) = positions[ri][ci];
+                attrs.push_str(&format!(" class=\"cell_r{r}_c{c}\""));
+            }
+            html.push_str(&format!("<{tag}{attrs}>{}</{tag}>", cell.html));
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</table>");
+    html
 }
 
 // ---- tests ------------------------------------------------------------------------------------
@@ -880,16 +1046,60 @@ mod tests {
         );
         let d = docx(&[("word/document.xml", &doc(&body))]);
         let c = docx_to_html(&d, "pics").unwrap();
-        assert_eq!(
-            c.body_html,
-            concat!(
-                "<table>",
+        assert!(
+            c.body_html.ends_with(concat!(
+                "<table class=\"wg-conv-t1\">",
                 "<tr><th colspan=\"2\"><p>head-wide</p></th><th><p>head-b</p></th></tr>",
                 "<tr><td rowspan=\"2\"><p>tall</p></td><td><p>r1c2</p></td><td><p>r1c3</p></td></tr>",
                 "<tr><td><p>r2c2</p></td><td><p>r2c3</p></td></tr>",
                 "</table>"
-            )
+            )),
+            "{}",
+            c.body_html
         );
+        // Unbordered source: the scoped block still pins border-collapse, nothing else.
+        assert!(c.body_html.starts_with("<style>\ntable.wg-conv-t1 { border-collapse: collapse; }\n</style>"), "{}", c.body_html);
+        assert!(!c.body_html.contains("style=\""), "no inline styles ever: {}", c.body_html);
+    }
+
+    #[test]
+    fn borders_and_shading_become_scoped_sheet_rules_never_inline() {
+        let body = concat!(
+            r#"<w:tbl><w:tblPr><w:tblBorders><w:top w:val="single"/></w:tblBorders></w:tblPr>"#,
+            r#"<w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:fill="D9D9D9"/></w:tcPr>"#,
+            r#"<w:p><w:r><w:t>label</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>value</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+        );
+        let d = docx(&[("word/document.xml", &doc(body))]);
+        let c = docx_to_html(&d, "pics").unwrap();
+        assert!(c.body_html.contains("table.wg-conv-t1, .wg-conv-t1 th, .wg-conv-t1 td { border: 1px solid #000000; }"), "{}", c.body_html);
+        assert!(c.body_html.contains(".wg-conv-t1 .cell_r1_c1 { background: #d9d9d9; }"), "{}", c.body_html);
+        assert!(c.body_html.contains("<th class=\"cell_r1_c1\"><p>label</p></th>"), "{}", c.body_html);
+        assert!(!c.body_html.contains("style=\""), "no inline styles ever: {}", c.body_html);
+    }
+
+    #[test]
+    fn segments_expose_tables_as_structure_with_simple_cells_detected() {
+        let body = concat!(
+            r#"<w:p><w:r><w:t>before</w:t></w:r></w:p>"#,
+            r#"<w:tbl><w:tr>"#,
+            r#"<w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Bold label</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>x &amp; y</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>second para</w:t></w:r></w:p></w:tc>"#,
+            r#"</w:tr></w:tbl>"#,
+            r#"<w:p><w:r><w:t>after</w:t></w:r></w:p>"#
+        );
+        let d = docx(&[("word/document.xml", &doc(body))]);
+        let out = docx_to_segments(&d, "pics").unwrap();
+        assert_eq!(out.segments.len(), 3);
+        let crate::Segment::Table(t) = &out.segments[1] else {
+            panic!("middle segment should be the table")
+        };
+        // Wholly-bold single paragraph: adoptable, with the raw (unescaped) text.
+        assert_eq!(t.rows[0][0].simple, Some(("Bold label".to_string(), true)));
+        // Two paragraphs: complex — keeps html, and the entity stays escaped there.
+        assert_eq!(t.rows[0][1].simple, None);
+        assert!(t.rows[0][1].html.contains("x &amp; y"));
     }
 
     #[test]
