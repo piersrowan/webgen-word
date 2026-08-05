@@ -1,6 +1,9 @@
+[workspace]
+members = ["webgen-convert"]
+
 [package]
 name = "webgen-word"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 authors = ["webgen <piers.rowan@webgen.com.au>"]
@@ -34,6 +37,9 @@ webgen-registry = { git = "ssh://git@github.com/piersrowan/webgen-registry.git",
 # chosen here is the same colour available in Paint, Edit and Swatch, and the saved palettes are
 # shared through the registry namespace com.webgen.Swatch.
 webgen-swatch = { git = "ssh://git@github.com/piersrowan/webgen-swatch.git", rev = "db339d9d80255ed4952cdfd4706518aee50051c3" }
+# $format -> HTML (docx today). An in-repo path dep — unlike webgen-registry above, it lives in
+# THIS tree, so it survives `cargo vendor` with the tree and needs no git pin.
+webgen-convert = { path = "webgen-convert" }
 
 [profile.release]
 opt-level = 2

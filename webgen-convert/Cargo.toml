@@ -1,0 +1,21 @@
+[package]
+name = "webgen-convert"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["webgen <piers.rowan@webgen.com.au>"]
+rust-version = "1.80"
+description = "webgen-convert -- $format -> HTML converters for the WebGen apps; docx first"
+
+# The component boundary Piers asked for (2026-08-05): every foreign document format becomes
+# sanitisable HTML, and every WebGen app that can show HTML can then show the format. Lives inside
+# the webgen-word workspace for now because Word is the first consumer; it takes bytes and returns
+# HTML + assets, does no IO and knows nothing about GTK, so it can graduate to its own repo the day
+# webgen-email wants docx attachments rendered inline.
+[dependencies]
+# docx is a DEFLATED zip (assets::read_zip in webgen-word only reads stored ones, by design).
+# bzip2/time features are C-flavoured baggage the OS build does not want.
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+
+[dev-dependencies]

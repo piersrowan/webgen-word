@@ -9,4 +9,4 @@ Terminal=false
 Categories=Office;WordProcessor;
 StartupNotify=true
 StartupWMClass=com.webgen.Word
-MimeType=text/html;application/xhtml+xml;
+MimeType=text/html;application/xhtml+xml;application/vnd.openxmlformats-officedocument.wordprocessingml.document;

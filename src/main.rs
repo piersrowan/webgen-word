@@ -341,6 +341,23 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                         None
                     }
                 },
+                // A .docx converts to html-plus-folder beside itself and THAT opens — same deal
+                // as the .wgz above. The original .docx is never modified.
+                Some(p) if is_docx(&p) => match convert_docx(&p) {
+                    Ok((doc, pictures)) => {
+                        let extra = if pictures > 0 {
+                            format!(" (+{pictures} picture{})", if pictures == 1 { "" } else { "s" })
+                        } else {
+                            String::new()
+                        };
+                        say(&format!("Converted to {}{extra} — editing the HTML copy.", doc.display()));
+                        Some(doc)
+                    }
+                    Err(e) => {
+                        say(&format!("Could not open {}: {e}", p.display()));
+                        None
+                    }
+                },
                 other => other,
             };
             let bytes = path.as_ref().map(|p| (p.clone(), std::fs::read(p)));
@@ -691,9 +708,10 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let state = state.clone();
         open_b.connect_clicked(move |_| {
             let filter = gtk::FileFilter::new();
-            filter.set_name(Some("HTML document"));
+            filter.set_name(Some("Documents (HTML, Word)"));
             filter.add_pattern("*.html");
             filter.add_pattern("*.htm");
+            filter.add_pattern("*.docx");
             let list = gtk::gio::ListStore::new::<gtk::FileFilter>();
             list.append(&filter);
             let d = gtk::FileDialog::builder().title("Open document").filters(&list).build();
@@ -1326,6 +1344,55 @@ fn unpack_wgz(archive: &Path) -> Result<(PathBuf, PathBuf), String> {
         }
     }
     document.map(|d| (d, target)).ok_or_else(|| "there is no document inside it".to_string())
+}
+
+fn is_docx(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("docx"))
+        .unwrap_or(false)
+}
+
+/// Convert a `.docx` into `stem.html` + `stem_files/` beside it and hand back the html to open.
+///
+/// Same shape as the `.wgz` unpack above and for the same reason: the working form is markup plus
+/// a folder, so a foreign format's job is to BECOME that form, once, next to itself — after which
+/// the ordinary open path (sanitiser included) treats it like any HTML it does not trust yet.
+/// Returns the html path and how many pictures were extracted.
+fn convert_docx(archive: &Path) -> Result<(PathBuf, usize), String> {
+    let bytes = std::fs::read(archive).map_err(|e| e.to_string())?;
+    let stem = archive
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "document".into());
+    // Never clobber: converting a second time makes stem-1.html, not a surprise overwrite.
+    let mut target = archive.with_file_name(format!("{stem}.html"));
+    let mut n = 0;
+    while target.exists() {
+        n += 1;
+        target = archive.with_file_name(format!("{stem}-{n}.html"));
+    }
+    let folder = assets::folder_name(&target);
+    let out = webgen_convert::docx_to_html(&bytes, &folder).map_err(|e| e.to_string())?;
+
+    if !out.assets.is_empty() {
+        let adir = assets::folder_path(&target);
+        std::fs::create_dir_all(&adir).map_err(|e| e.to_string())?;
+        for (name, data) in &out.assets {
+            // The converter promises plain basenames; hold it to that rather than trust it.
+            if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+                return Err(format!("{name} is not a name this can write safely"));
+            }
+            std::fs::write(adir.join(name), data).map_err(|e| e.to_string())?;
+        }
+    }
+    let html = format!(
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{}</title></head>\n<body>\n{}\n</body></html>\n",
+        doc::escape(&stem),
+        out.body_html
+    );
+    std::fs::write(&target, html).map_err(|e| e.to_string())?;
+    Ok((target, out.assets.len()))
 }
 
 /// Ask for a path with one filter, then hand it back.
