@@ -180,6 +180,43 @@ fn escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Escape, then keep runs of spaces VISIBLE: HTML collapses whitespace, so a form's pen-fill
+/// field — `     /      /` under `xml:space="preserve"` — rendered as `/ /`, and the column it
+/// was sizing collapsed with it. Piers, 2026-08-06: seed the data as it presents in HTML rather
+/// than fight the layout afterwards.
+///
+/// Each run of N>=2 spaces becomes N-1 non-breaking spaces plus one ordinary space, so the width
+/// survives AND the text can still wrap there. SINGLE spaces are left alone: a run boundary falls
+/// between `<w:t>` elements all the time (`bold`, ` and `, `italic`), and hardening those would
+/// glue formatted words to their neighbours and stop the line wrapping at all.
+fn escape_text(s: &str) -> String {
+    let escaped = escape(s);
+    let mut out = String::with_capacity(escaped.len());
+    let bytes: Vec<char> = escaped.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == ' ' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == ' ' {
+                i += 1;
+            }
+            let run = i - start;
+            if run >= 2 {
+                for _ in 0..run - 1 {
+                    out.push_str("&nbsp;");
+                }
+                out.push(' ');
+            } else {
+                out.push(' ');
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn escape_attr(s: &str) -> String {
     escape(s).replace('"', "&quot;")
 }
@@ -496,7 +533,7 @@ impl Parser {
                     if !self.in_field_instruction && !in_del {
                         // instrText is skipped wholesale via the flag; ordinary w:t lands here.
                         let text = t.unescape().map_err(|e| e.to_string())?;
-                        inner.push_str(&fmt.wrap(&escape(&text)));
+                        inner.push_str(&fmt.wrap(&escape_text(&text)));
                     }
                 }
                 Event::End(e) => match local_name(e.name().as_ref()) {
@@ -1184,6 +1221,25 @@ mod tests {
         let d = docx(&[("word/document.xml", &doc(body))]);
         let c = docx_to_html(&d, "pics").unwrap();
         assert_eq!(c.body_html, "<p>a &lt;b&gt; &amp; c kept</p>");
+    }
+
+    #[test]
+    fn pen_fill_whitespace_keeps_its_width() {
+        // The date field in the marking-criteria form: five spaces, a slash, six spaces, a slash.
+        // Collapsed to "/ /" it sized nothing and the column bunched (Piers, 2026-08-06).
+        let body = r#"<w:p><w:r><w:t xml:space="preserve">     /      /</w:t></w:r></w:p>"#;
+        let d = docx(&[("word/document.xml", &doc(body))]);
+        let c = docx_to_html(&d, "pics").unwrap();
+        assert_eq!(
+            c.body_html,
+            "<p>&nbsp;&nbsp;&nbsp;&nbsp; /&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; /</p>"
+        );
+        // Ordinary prose keeps ordinary spaces, or nothing would ever wrap.
+        let plain = docx(&[(
+            "word/document.xml",
+            &doc(r#"<w:p><w:r><w:t>one two three</w:t></w:r></w:p>"#),
+        )]);
+        assert_eq!(docx_to_html(&plain, "pics").unwrap().body_html, "<p>one two three</p>");
     }
 
     #[test]
