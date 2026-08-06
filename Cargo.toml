@@ -3,7 +3,7 @@ members = ["webgen-convert"]
 
 [package]
 name = "webgen-word"
-version = "0.14.1"
+version = "0.15.0"
 edition = "2021"
 license = "MIT"
 authors = ["webgen <piers.rowan@webgen.com.au>"]

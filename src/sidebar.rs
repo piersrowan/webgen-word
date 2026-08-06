@@ -487,8 +487,11 @@ pub fn build(
             all_b.set_sensitive(taggable);
             all_b.set_label(&format!("All <{}>", s.tag));
 
-            // Piers' rule: an element the document already styles specifically opens on "this one".
-            let instance = s.specific || !taggable;
+            // Piers' rule, revised 2026-08-06 UAT: the panel opens on THE SELECTED ELEMENT —
+            // "this one" — every time. Document-wide is one click away on "All <tag>"; making
+            // the wider blast radius the default was the wrong way round. (The 2026-08-01
+            // default-All ruling is superseded by the author of both.)
+            let instance = true;
             ui.instance_scope.set(instance);
             ui.loading.set(true);
             if instance {

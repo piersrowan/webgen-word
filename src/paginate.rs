@@ -70,10 +70,14 @@ pub fn check_script(page_px: f64) -> String {
             }}
         }}
         /* A block taller than the page owns its page(s) and overflows honestly: the next
-           measurement starts BELOW it, or everything after it would break one line each. */
+           measurement starts BELOW it, or everything after it would break one line each. The
+           count must own them too — a table spanning three sheets IS three pages, and growing
+           it should move the number even though no marker can land inside a block (2026-08-06:
+           "new lines inside a table didn't count"). */
         if (el.offsetHeight > limit) {{
             pageTop = bottom;
             slack = false;
+            pages += Math.max(0, Math.ceil(el.offsetHeight / PAGE) - 1);
         }}
     }}
     return inserted + "," + pages;
