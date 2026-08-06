@@ -196,6 +196,21 @@ li, tr, h1, h2, h3 {{ break-inside: avoid; page-break-inside: avoid; }}
     margin: 6mm -{r}mm 6mm -{l}mm;
     border-top: 1px dashed rgba(0, 0, 0, 0.35);
   }}
+  /* An auto-inserted break (the 94% gate) reads slightly softer than a deliberate one. */
+  .{brk}.wg-auto {{ border-top-style: dotted; }}
+}}
+/* The slack marker: let this page run long. Screen-only — it changes where the AUTO gate
+   fires, it is not itself a break, and print must never show it. */
+.wg-page-slack {{ border: 0; height: 0; }}
+@media screen {{
+  .wg-page-slack {{
+    height: auto;
+    margin: 2mm -{r}mm 2mm -{l}mm;
+    border-top: 1px dotted rgba(200, 120, 0, 0.55);
+  }}
+}}
+@media print {{
+  .wg-page-slack {{ display: none; }}
 }}
 ",
         paper = setup.paper.css_size(),

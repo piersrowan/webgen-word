@@ -36,6 +36,7 @@ mod doc;
 mod docstyle;
 mod js;
 mod page;
+mod paginate;
 mod sanitise;
 mod settings;
 mod sidebar;
@@ -1115,6 +1116,82 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
 
     // The two one-file forms. Both are "save a copy": neither changes what the document is, so
     // neither takes over the title bar or the modified state.
+    // --- pages: the marker gate's controls + the whole-document PDF reader --------------------
+    let pages_section = gtk::gio::Menu::new();
+    pages_section.append(Some("Allow this page to run long"), Some(&action(&window, "page-slack", {
+        let view = view.clone();
+        let say = say.clone();
+        move || {
+            view.execute_editing_command_with_argument(
+                "InsertHTML",
+                &format!("<hr class=\"{}\">", paginate::SLACK_CLASS),
+            );
+            say("This page may run to 110% before the automatic break fires.");
+        }
+    })));
+    pages_section.append(Some("Repaginate"), Some(&action(&window, "repaginate", {
+        let view = view.clone();
+        let state = state.clone();
+        let say = say.clone();
+        move || {
+            let px = paginate::inner_height_px(&state.borrow().setup);
+            let say = say.clone();
+            view.evaluate_javascript(
+                &paginate::repaginate_script(px),
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    if let Ok(v) = res {
+                        let out = v.to_str().to_string();
+                        let pages = out.split(',').nth(1).unwrap_or("?").to_string();
+                        say(&format!("Repaginated — {pages} page(s)."));
+                    }
+                },
+            );
+        }
+    })));
+    pages_section.append(Some("Read as PDF"), Some(&action(&window, "read-pdf", {
+        let view = view.clone();
+        let state = state.clone();
+        let say = say.clone();
+        let printing = printing.clone();
+        move || {
+            // The whole document, paginated by its markers, in webgen-pdf — reading mode without
+            // teaching the editor to page. The file is a throwaway in the cache; the reader holds
+            // it open and the next Read overwrites it.
+            let out = gtk::glib::user_cache_dir().join("webgen-word");
+            let _ = std::fs::create_dir_all(&out);
+            let pdf = out.join(format!("read-{}.pdf", std::process::id()));
+            let op = webkit6::PrintOperation::new(&view);
+            op.set_page_setup(&state.borrow().setup.to_gtk());
+            let ps = gtk::PrintSettings::new();
+            ps.set(gtk::PRINT_SETTINGS_PRINTER, Some("Print to File"));
+            ps.set(gtk::PRINT_SETTINGS_OUTPUT_URI, Some(&format!("file://{}", pdf.display())));
+            ps.set(gtk::PRINT_SETTINGS_OUTPUT_FILE_FORMAT, Some("pdf"));
+            op.set_print_settings(&ps);
+            {
+                let say = say.clone();
+                let printing = printing.clone();
+                let pdf = pdf.clone();
+                op.connect_finished(move |_| {
+                    printing.borrow_mut().take();
+                    match std::process::Command::new("webgen-pdf").arg(&pdf).spawn() {
+                        Ok(_) => say("Opened in the PDF reader."),
+                        Err(e) => say(&format!("PDF written to {} (reader: {e})", pdf.display())),
+                    }
+                });
+            }
+            {
+                let say = say.clone();
+                op.connect_failed(move |_, e| say(&format!("Could not write the PDF: {e}")));
+            }
+            *printing.borrow_mut() = Some(op.clone());
+            op.print();
+        }
+    })));
+    menu.append_section(None, &pages_section);
+
     let export_section = gtk::gio::Menu::new();
     export_section.append(Some("Save a copy as one file…"), Some(&action(&window, "export-single", {
         let (window, save_to) = (window.clone(), save_to.clone());
@@ -1256,6 +1333,47 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     tv.add_top_bar(&header);
     tv.set_content(Some(&content));
     window.set_content(Some(&tv));
+    // The 94% gate (see `paginate`). A light timer, not a keystroke hook: measuring the page on
+    // every key would fight the typing, and a marker landing up to a couple of seconds after the
+    // line that crossed the window is exactly as useful. Runs only while this window is the
+    // active one; ends with the window.
+    {
+        let view = view.clone();
+        let state = state.clone();
+        let say = say.clone();
+        let win_weak = window.downgrade();
+        let last_pages: Rc<std::cell::Cell<i64>> = Rc::new(std::cell::Cell::new(1));
+        glib::timeout_add_local(std::time::Duration::from_millis(2500), move || {
+            let Some(win) = win_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !win.is_active() || state.borrow().baseline.is_empty() {
+                return glib::ControlFlow::Continue;
+            }
+            let px = paginate::inner_height_px(&state.borrow().setup);
+            let say = say.clone();
+            let last_pages = last_pages.clone();
+            view.evaluate_javascript(
+                &paginate::check_script(px),
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    let Ok(v) = res else { return };
+                    let out = v.to_str().to_string();
+                    let mut parts = out.split(',');
+                    let inserted: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let pages: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                    if inserted > 0 || pages != last_pages.get() {
+                        last_pages.set(pages);
+                        say(&format!("{pages} page(s)."));
+                    }
+                },
+            );
+            glib::ControlFlow::Continue
+        });
+    }
+
     window.present();
 }
 
