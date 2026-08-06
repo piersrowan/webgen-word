@@ -39,6 +39,22 @@ pub struct ConvertedSegments {
     pub segments: Vec<Segment>,
     pub assets: Vec<(String, Vec<u8>)>,
     pub notes: Vec<String>,
+    /// The document's OWN page geometry from `w:sectPr`, in millimetres. Ignoring it was why a
+    /// converted form printed to more pages than Word or LibreOffice give it: the app's A4/20mm
+    /// default is narrower than the ~15/12/9mm these templates actually use, so ~25% less content
+    /// fitted per page (2026-08-06).
+    pub page: Option<DocPage>,
+}
+
+/// Page size and margins, millimetres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DocPage {
+    pub width_mm: f64,
+    pub height_mm: f64,
+    pub top_mm: f64,
+    pub right_mm: f64,
+    pub bottom_mm: f64,
+    pub left_mm: f64,
 }
 
 pub struct DocCell {

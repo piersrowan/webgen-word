@@ -7,7 +7,7 @@
 //! table-heavy assessment forms: tables with gridSpan/vMerge merges dominate, headings and
 //! style-carried bullets follow, images are rare. That ordering is why tables get the most care.
 
-use crate::{Converted, ConvertedSegments, DocCell, DocTable, Segment};
+use crate::{Converted, ConvertedSegments, DocCell, DocPage, DocTable, Segment};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use std::collections::HashMap;
@@ -86,6 +86,7 @@ pub fn docx_to_segments(docx: &[u8], asset_dir: &str) -> Result<ConvertedSegment
         segments,
         assets: p.assets,
         notes: p.notes,
+        page: parse_sect_pr(&document),
     })
 }
 
@@ -102,6 +103,50 @@ fn read_entry(
         Err(zip::result::ZipError::FileNotFound) => Ok(None),
         Err(e) => Err(format!("{name}: {e}")),
     }
+}
+
+/// The document's page geometry from the body's `w:sectPr`. Twips (1/1440 inch) throughout;
+/// a landscape or missing size yields None rather than a guess.
+fn parse_sect_pr(xml: &[u8]) -> Option<DocPage> {
+    fn mm(twips: f64) -> f64 {
+        twips / 1440.0 * 25.4
+    }
+    let mut r = Reader::from_reader(xml);
+    r.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let (mut w, mut h) = (0.0f64, 0.0f64);
+    let (mut t, mut rr, mut b, mut l) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    loop {
+        match r.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match local_name(e.name().as_ref()) {
+                b"pgSz" => {
+                    w = attr(&e, "w").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                    h = attr(&e, "h").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                }
+                b"pgMar" => {
+                    t = attr(&e, "top").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                    rr = attr(&e, "right").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                    b = attr(&e, "bottom").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                    l = attr(&e, "left").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some(DocPage {
+        width_mm: mm(w),
+        height_mm: mm(h),
+        top_mm: mm(t),
+        right_mm: mm(rr),
+        bottom_mm: mm(b),
+        left_mm: mm(l),
+    })
 }
 
 // ---- attribute helpers ------------------------------------------------------------------------

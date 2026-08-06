@@ -511,7 +511,10 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                         let mode = ConvertMode::from_key(resp);
                         settings.set_string("docx_convert_mode", mode.key());
                         match convert_docx(&p, mode) {
-                            Ok((doc, tmp_dir, suggested, pictures)) => {
+                            Ok((doc, tmp_dir, suggested, pictures, setup)) => {
+                                if let Some(setup) = setup {
+                                    state.borrow_mut().setup = setup;
+                                }
                                 let extra = if pictures > 0 {
                                     format!(" (+{pictures} picture{})", if pictures == 1 { "" } else { "s" })
                                 } else {
@@ -1889,7 +1892,7 @@ fn sweep_stale_converts() {
 fn convert_docx(
     archive: &Path,
     mode: ConvertMode,
-) -> Result<(PathBuf, PathBuf, PathBuf, usize), String> {
+) -> Result<(PathBuf, PathBuf, PathBuf, usize, Option<PageSetup>), String> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -1954,7 +1957,23 @@ fn convert_docx(
         body
     );
     std::fs::write(&target, html).map_err(|e| e.to_string())?;
-    Ok((target, tmp_dir, suggested, out.assets.len()))
+    // The document's OWN page geometry, when it carries one and the paper is one we offer.
+    // Printing a converted form at the app's A4/20mm default instead of the template's real
+    // margins cost ~25% of the content area — the "prints to more pages than Word does" report
+    // (2026-08-06). Margins are clamped to what the panel itself allows.
+    let setup = out.page.and_then(|p| {
+        page::Paper::nearest(p.width_mm, p.height_mm).map(|paper| {
+            let cap = |v: f64| v.clamp(0.0, 60.0).round();
+            PageSetup {
+                paper,
+                top: cap(p.top_mm),
+                right: cap(p.right_mm),
+                bottom: cap(p.bottom_mm),
+                left: cap(p.left_mm),
+            }
+        })
+    });
+    Ok((target, tmp_dir, suggested, out.assets.len(), setup))
 }
 
 /// Ask for a path with one filter, then hand it back.

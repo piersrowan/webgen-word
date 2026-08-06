@@ -92,6 +92,21 @@ impl Paper {
         }
     }
 
+    /// The offered paper whose dimensions are closest to a size in millimetres — how an imported
+    /// document's own `w:pgSz` becomes one of ours. Within ~5mm on both edges or None: a size that
+    /// matches nothing offered should not be silently rounded into A4.
+    pub fn nearest(width_mm: f64, height_mm: f64) -> Option<Paper> {
+        Paper::ALL
+            .into_iter()
+            .map(|p| {
+                let d = (p.width_mm() - width_mm).abs().max((p.height_mm() - height_mm).abs());
+                (p, d)
+            })
+            .filter(|(_, d)| *d <= 5.0)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(p, _)| p)
+    }
+
     /// Full paper width in millimetres.
     pub fn width_mm(self) -> f64 {
         match self {
@@ -257,5 +272,15 @@ mod tests {
     fn content_width_follows_the_paper() {
         let a4 = PageSetup::default();
         assert_eq!(a4.content_width_mm(), 170.0);
+    }
+
+    #[test]
+    fn nearest_paper_matches_real_docx_sizes_and_refuses_strangers() {
+        // A4 and US Letter as Word writes them (11906x16838 and 12240x15840 twips -> mm).
+        assert_eq!(Paper::nearest(210.0, 297.0), Some(Paper::A4));
+        assert_eq!(Paper::nearest(215.9, 279.4), Some(Paper::Letter));
+        assert_eq!(Paper::nearest(215.9, 355.6), Some(Paper::Legal));
+        // A3 is not offered: better to keep the app default than silently print it as A4.
+        assert_eq!(Paper::nearest(297.0, 420.0), None);
     }
 }

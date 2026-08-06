@@ -46,14 +46,25 @@ pub fn check_script(page_px: f64) -> String {
     function isBreak(el) {{ return el.classList && (el.classList.contains("webgen-page-break") || el.classList.contains("pagebreak")); }}
     function isSlack(el) {{ return el.classList && el.classList.contains("{slack}"); }}
     var kids = Array.prototype.slice.call(body.children);
-    var pageTop = 0, slack = false, inserted = 0, pages = 1;
+    var pageTop = 0, slack = false, inserted = 0, pages = 1, placed = 0;
     for (var i = 0; i < kids.length; i++) {{
         var el = kids[i];
-        if (isBreak(el)) {{ pageTop = el.offsetTop + el.offsetHeight; slack = false; pages++; continue; }}
+        if (isBreak(el)) {{ pageTop = el.offsetTop + el.offsetHeight; slack = false; placed = 0; pages++; continue; }}
         if (isSlack(el)) {{ slack = true; continue; }}
         if (el.offsetHeight === 0) continue; /* hidden or empty: never a reason to break */
         var bottom = el.offsetTop + el.offsetHeight;
         var limit = PAGE * (slack ? 1.10 : 0.94);
+        /* Never break with nothing on the page yet: a document whose FIRST block is taller than
+           the window (an assessment form opening on a big table) would otherwise get a break at
+           position zero and print a blank first page (2026-08-06). A block with no room above it
+           starts where it starts and overflows. */
+        if (placed === 0) {{
+            placed++;
+            if (el.offsetHeight > limit) {{ pageTop = bottom; slack = false; placed = 0;
+                pages += Math.max(0, Math.ceil(el.offsetHeight / PAGE) - 1); }}
+            continue;
+        }}
+        placed++;
         if (bottom - pageTop > limit && el.offsetTop > pageTop) {{
             /* Idempotency is the whole game: a break already sitting immediately above this
                block means the gate has ALREADY answered here — inserting again every pass is
@@ -77,6 +88,7 @@ pub fn check_script(page_px: f64) -> String {
         if (el.offsetHeight > limit) {{
             pageTop = bottom;
             slack = false;
+            placed = 0;
             pages += Math.max(0, Math.ceil(el.offsetHeight / PAGE) - 1);
         }}
     }}
