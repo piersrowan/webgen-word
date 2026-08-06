@@ -36,6 +36,7 @@ mod doc;
 mod docstyle;
 mod js;
 mod page;
+mod paged;
 mod paginate;
 mod sanitise;
 mod settings;
@@ -210,6 +211,129 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     header.pack_end(&menu_b);
     header.pack_end(&print_b);
     header.pack_end(&style_b);
+
+    // Pages view (read-only two-page spread; see `paged`). The toggle lives in the header; the
+    // [<] Pages x–y of N [>] strip only exists while the view is on.
+    let pages_b = gtk::ToggleButton::builder()
+        .icon_name("view-dual-symbolic")
+        .tooltip_text("Pages view — read the document as spreads (Esc leaves)")
+        .build();
+    let pages_prev = gtk::Button::from_icon_name("go-previous-symbolic");
+    let pages_next = gtk::Button::from_icon_name("go-next-symbolic");
+    let pages_label = gtk::Label::new(None);
+    let pages_nav = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    pages_nav.append(&pages_prev);
+    pages_nav.append(&pages_label);
+    pages_nav.append(&pages_next);
+    pages_nav.set_visible(false);
+    header.pack_end(&pages_nav);
+    header.pack_end(&pages_b);
+
+    // Shared view-mode state, created early so the save/print/timer guards further down can see
+    // it. `spread_first` is the LEFT page of the visible pair, 0-based.
+    let paged_active: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+    let spread_first: Rc<std::cell::Cell<usize>> = Rc::new(std::cell::Cell::new(0));
+    let page_total: Rc<std::cell::Cell<usize>> = Rc::new(std::cell::Cell::new(1));
+
+    {
+        // Entering wraps the document into sheets and drops editability; leaving unwraps and
+        // restores it. The show step is shared with [<] [>].
+        let show_spread = {
+            let view = view.clone();
+            let label = pages_label.clone();
+            let spread_first = spread_first.clone();
+            let page_total = page_total.clone();
+            Rc::new(move || {
+                let first = spread_first.get();
+                let total = page_total.get();
+                let last_shown = (first + 2).min(total);
+                label.set_text(&format!("Pages {}–{} of {}", first + 1, last_shown, total));
+                view.evaluate_javascript(
+                    &paged::show_script(first),
+                    None,
+                    None,
+                    gtk::gio::Cancellable::NONE,
+                    |_| {},
+                );
+            })
+        };
+        {
+            let view = view.clone();
+            let state = state.clone();
+            let nav = pages_nav.clone();
+            let paged_active = paged_active.clone();
+            let spread_first = spread_first.clone();
+            let page_total = page_total.clone();
+            let show_spread = show_spread.clone();
+            pages_b.connect_toggled(move |b| {
+                if b.is_active() {
+                    let px = paginate::inner_height_px(&state.borrow().setup);
+                    let view2 = view.clone();
+                    let nav = nav.clone();
+                    let paged_active = paged_active.clone();
+                    let spread_first = spread_first.clone();
+                    let page_total = page_total.clone();
+                    let show_spread = show_spread.clone();
+                    view.evaluate_javascript(
+                        &paged::enter_script(px),
+                        None,
+                        None,
+                        gtk::gio::Cancellable::NONE,
+                        move |res| {
+                            let pages: usize = res
+                                .ok()
+                                .map(|v| v.to_str().to_string())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            if pages == 0 {
+                                return; // nothing wrapped (empty document); stay in edit view
+                            }
+                            paged_active.set(true);
+                            page_total.set(pages);
+                            spread_first.set(0);
+                            view2.set_editable(false);
+                            nav.set_visible(true);
+                            show_spread();
+                        },
+                    );
+                } else if paged_active.get() {
+                    paged_active.set(false);
+                    nav.set_visible(false);
+                    view.set_editable(true);
+                    view.evaluate_javascript(
+                        &paged::exit_script(),
+                        None,
+                        None,
+                        gtk::gio::Cancellable::NONE,
+                        |_| {},
+                    );
+                }
+            });
+        }
+        {
+            let spread_first = spread_first.clone();
+            let show_spread = show_spread.clone();
+            pages_prev.connect_clicked(move |_| {
+                let f = spread_first.get();
+                if f > 0 {
+                    spread_first.set(f - 1);
+                    show_spread();
+                }
+            });
+        }
+        {
+            let spread_first = spread_first.clone();
+            let page_total = page_total.clone();
+            pages_next.connect_clicked(move |_| {
+                // The last spread ends ON the last page (…, N-1,N) — never walks past it.
+                let f = spread_first.get();
+                if f < page_total.get().saturating_sub(2) {
+                    spread_first.set(f + 1);
+                    show_spread();
+                }
+            });
+        }
+    }
 
     // --- formatting row ----------------------------------------------------------------------
     // `execute_editing_command` names are WebKit's own.
@@ -718,7 +842,13 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let save_to = save_to.clone();
         let window = window.clone();
         let state = state.clone();
+        let paged_active = paged_active.clone();
+        let say = say.clone();
         Rc::new(move || {
+            if paged_active.get() {
+                say("Leave Pages view first — what is on screen is a reading layout, not the document.");
+                return;
+            }
             let filter = gtk::FileFilter::new();
             filter.set_name(Some("HTML document"));
             filter.add_pattern("*.html");
@@ -754,7 +884,15 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let save_to = save_to.clone();
         let save_as = save_as.clone();
         let state = state.clone();
+        let paged_active = paged_active.clone();
+        let say = say.clone();
         Rc::new(move || {
+            // Pages view wraps the DOM in sheet scaffolding; saving now would write the
+            // scaffolding into the file. Refuse rather than silently unwrap-and-rewrap.
+            if paged_active.get() {
+                say("Leave Pages view first — what is on screen is a reading layout, not the document.");
+                return;
+            }
             // Read the path out and let the borrow go before saving: holding a RefCell borrow across
             // a call that may re-enter it is a panic waiting for someone to make the callback
             // synchronous. A docx preview's "path" is its TEMP home — plain Save must ask where
@@ -1050,7 +1188,13 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let window = window.clone();
         let state = state.clone();
         let printing = printing.clone();
+        let paged_active = paged_active.clone();
+        let say = say.clone();
         Rc::new(move || {
+            if paged_active.get() {
+                say("Leave Pages view first — printing here would print the reading layout.");
+                return;
+            }
             let op = webkit6::PrintOperation::new(&view);
             // THE important line. Without it the print uses GTK's defaults (US Letter, ~10mm) and
             // the document's own @page is ignored -- measured, see the module docs.
@@ -1156,7 +1300,12 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let state = state.clone();
         let say = say.clone();
         let printing = printing.clone();
+        let paged_active = paged_active.clone();
         move || {
+            if paged_active.get() {
+                say("Leave Pages view first — the PDF prints the document, not the reading layout.");
+                return;
+            }
             // The whole document, paginated by its markers, in webgen-pdf — reading mode without
             // teaching the editor to page. The file is a throwaway in the cache; the reader holds
             // it open and the next Read overwrites it.
@@ -1266,6 +1415,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let view_k = view.clone();
         let zoom = zoom.clone();
+        let pages_toggle = pages_b.clone();
         let new_click = new_b.clone();
         let open_click = open_b.clone();
         let print = print.clone();
@@ -1298,6 +1448,10 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                 (true, _, Key::plus | Key::equal | Key::KP_Add) => zoom(0.1),
                 (true, false, Key::minus | Key::KP_Subtract) => zoom(-0.1),
                 (true, false, Key::_0 | Key::KP_0) => zoom(0.0),
+                // Esc leaves Pages view; anywhere else it stays WebKit's.
+                (false, false, Key::Escape) if pages_toggle.is_active() => {
+                    pages_toggle.set_active(false)
+                }
                 (true, _, Key::Return | Key::KP_Enter) => brk_click.emit_clicked(),
                 // Tab indents, Shift+Tab outdents. In a list this is how a sub-list is made, which
                 // is the behaviour every word processor has and the reason Tab does not insert a
@@ -1342,12 +1496,14 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let state = state.clone();
         let say = say.clone();
         let win_weak = window.downgrade();
+        let paged_active = paged_active.clone();
         let last_pages: Rc<std::cell::Cell<i64>> = Rc::new(std::cell::Cell::new(1));
         glib::timeout_add_local(std::time::Duration::from_millis(2500), move || {
             let Some(win) = win_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            if !win.is_active() || state.borrow().baseline.is_empty() {
+            if !win.is_active() || state.borrow().baseline.is_empty() || paged_active.get() {
+                // Paused in Pages view: the sheets change every offset the gate measures by.
                 return glib::ControlFlow::Continue;
             }
             let px = paginate::inner_height_px(&state.borrow().setup);
