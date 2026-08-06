@@ -203,6 +203,10 @@ impl StyleRows {
             font_weight: pick(WEIGHTS, self.weight.selected()),
             font_style: pick(SLANTS, self.slant.selected()),
             text_decoration: pick(DECORATIONS, self.decoration.selected()),
+            // The document-defaults panel does not offer these two (the element sidebar does);
+            // an empty value says nothing, which is the correct default for a default.
+            letter_spacing: String::new(),
+            line_height: String::new(),
             colour: self.text_colour.hex_or_empty(),
             background: self.background.hex_or_empty(),
             border: docstyle::compose_border(

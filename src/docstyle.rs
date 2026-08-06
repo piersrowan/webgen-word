@@ -257,6 +257,10 @@ pub struct TagStyle {
     pub font_style: String,
     /// `none` | `underline` | `line-through`.
     pub text_decoration: String,
+    /// Kerning, e.g. `0.5px` or `0.05em`. Empty says nothing.
+    pub letter_spacing: String,
+    /// Unitless multiplier, e.g. `1.5`. Empty says nothing.
+    pub line_height: String,
     pub colour: String,     // #rrggbb
     pub background: String, // #rrggbb
     pub border: String,     // e.g. "1px solid #cccccc"
@@ -287,6 +291,8 @@ impl TagStyle {
             ("font-weight", self.font_weight.as_str()),
             ("font-style", self.font_style.as_str()),
             ("text-decoration", self.text_decoration.as_str()),
+            ("letter-spacing", self.letter_spacing.as_str()),
+            ("line-height", self.line_height.as_str()),
             ("color", self.colour.as_str()),
             ("background", self.background.as_str()),
             ("border", self.border.as_str()),

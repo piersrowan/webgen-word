@@ -169,8 +169,13 @@ pub fn build(
     scope_note.set_margin_end(10);
     scope_note.set_margin_top(4);
 
-    // --- the properties --------------------------------------------------------------------------
-    let group = adw::PreferencesGroup::new();
+    // --- the properties, in two tabs (Piers, 2026-08-06) ----------------------------------------
+    // "Type" is everything about the letters; "Box" is everything about the container. Same rows,
+    // same Apply, same scoping — the tabs only organise. A third tab waits for the
+    // others-that-got-forgotten.
+    let g_type = adw::PreferencesGroup::new();
+    let g_box = adw::PreferencesGroup::new();
+    let group = g_type.clone(); // the typography rows land here
 
     let font = gtk::FontDialogButton::new(Some(gtk::FontDialog::new()));
     font.set_valign(gtk::Align::Center);
@@ -206,10 +211,18 @@ pub fn build(
     decoration.set_model(Some(&gtk::StringList::new(DECORATIONS)));
     group.add(&decoration);
 
+    // Kerning and leading — the two knobs Piers named that the panel lacked (2026-08-06).
+    let letter_spacing = length_row("Letter spacing", "0 says nothing", &group);
+    let line_height = adw::SpinRow::with_range(0.0, 3.0, 0.05);
+    line_height.set_digits(2);
+    line_height.set_title("Line height");
+    line_height.set_subtitle("Multiplier; 0 says nothing");
+    group.add(&line_height);
+
     let text_colour = ColourRow::new("Text colour", settings, "#1a1a1a");
     group.add(&text_colour.row);
     let background = ColourRow::new("Background", settings, "#ffffff");
-    group.add(&background.row);
+    g_box.add(&background.row);
 
     // Border: three pickers, not a string to get wrong. **Width 0 removes the declaration
     // entirely** rather than writing `border: none` -- Piers' rule, and the one that leaves the
@@ -217,45 +230,55 @@ pub fn build(
     let border_width = adw::SpinRow::with_range(0.0, 40.0, 1.0);
     border_width.set_title("Border width");
     border_width.set_subtitle("0 removes the border");
-    group.add(&border_width);
+    g_box.add(&border_width);
 
     let border_style = adw::ComboRow::new();
     border_style.set_title("Border style");
     border_style.set_model(Some(&gtk::StringList::new(docstyle::BORDER_STYLES)));
-    group.add(&border_style);
+    g_box.add(&border_style);
 
     let border_colour = ColourRow::new("Border colour", settings, "#000000");
-    group.add(&border_colour.row);
+    g_box.add(&border_colour.row);
 
     let radius = adw::SpinRow::with_range(0.0, 60.0, 1.0);
     radius.set_title("Corner radius");
-    group.add(&radius);
+    g_box.add(&radius);
 
     let shadow = adw::SwitchRow::new();
     shadow.set_title("Drop shadow");
-    group.add(&shadow);
+    g_box.add(&shadow);
 
     // Numbers with units, not free text -- see `stylerows::LengthRow` for why.
-    let padding = length_row("Padding", "One value for all four sides", &group);
-    let margin = length_row("Margin", "One value for all four sides", &group);
-    let width = length_row("Width", "0 leaves the width to the content", &group);
+    let padding = length_row("Padding", "One value for all four sides", &g_box);
+    let margin = length_row("Margin", "One value for all four sides", &g_box);
+    let width = length_row("Width", "0 leaves the width to the content", &g_box);
 
     let float = adw::ComboRow::new();
     float.set_title("Float");
     float.set_subtitle("Text wraps the other side");
     float.set_model(Some(&gtk::StringList::new(FLOATS)));
-    group.add(&float);
+    g_box.add(&float);
 
     let align = adw::ComboRow::new();
     align.set_title("Alignment");
     align.set_model(Some(&gtk::StringList::new(ALIGNS)));
     group.add(&align);
 
+    let tabs = gtk::Stack::new();
+    tabs.set_transition_type(gtk::StackTransitionType::Crossfade);
+    tabs.add_titled(&g_type, Some("type"), "Type");
+    tabs.add_titled(&g_box, Some("box"), "Box");
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&tabs));
+    switcher.set_halign(gtk::Align::Center);
+
     let rows_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
     rows_box.set_margin_top(12);
     rows_box.set_margin_start(8);
     rows_box.set_margin_end(8);
-    rows_box.append(&group);
+    rows_box.append(&switcher);
+    rows_box.append(&tabs);
+    let _ = &group; // g_type by its working alias; the rows above filled it
     let scroller = gtk::ScrolledWindow::builder().child(&rows_box).vexpand(true).build();
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroller.set_propagate_natural_width(false);
@@ -323,7 +346,7 @@ pub fn build(
         );
         let width = width.clone();
         let (weight, slant, decoration) = (weight.clone(), slant.clone(), decoration.clone());
-        let (weight, slant, decoration) = (weight.clone(), slant.clone(), decoration.clone());
+        let (letter_spacing, line_height) = (letter_spacing.clone(), line_height.clone());
         let (border_width, border_style, border_colour) =
             (border_width.clone(), border_style.clone(), border_colour.clone());
         let (text_colour, background) = (text_colour.clone(), background.clone());
@@ -369,6 +392,8 @@ pub fn build(
             set_length(&padding, &style.padding);
             set_length(&margin, &style.margin);
             set_length(&width, &style.width);
+            set_length(&letter_spacing, &style.letter_spacing);
+            line_height.set_value(style.line_height.parse::<f64>().unwrap_or(0.0));
             float.set_selected(FLOATS.iter().position(|f| *f == style.float).unwrap_or(0) as u32);
             align.set_selected(ALIGNS.iter().position(|a| *a == style.text_align).unwrap_or(0) as u32);
             ui.loading.set(false);
@@ -381,6 +406,8 @@ pub fn build(
             padding.clone(), margin.clone(), float.clone(), align.clone(),
         );
         let width = width.clone();
+        let (weight, slant, decoration) = (weight.clone(), slant.clone(), decoration.clone());
+        let (letter_spacing, line_height) = (letter_spacing.clone(), line_height.clone());
         let (border_width, border_style, border_colour) =
             (border_width.clone(), border_style.clone(), border_colour.clone());
         let (text_colour, background) = (text_colour.clone(), background.clone());
@@ -406,6 +433,13 @@ pub fn build(
                 font_weight: pick(WEIGHTS, weight.selected()),
                 font_style: pick(SLANTS, slant.selected()),
                 text_decoration: pick(DECORATIONS, decoration.selected()),
+                letter_spacing: get_length(&letter_spacing),
+                line_height: if line_height.value() > 0.0 {
+                    let v = format!("{:.2}", line_height.value());
+                    v.trim_end_matches('0').trim_end_matches('.').to_string()
+                } else {
+                    String::new()
+                },
                 colour: text_colour.hex_or_empty(),
                 background: background.hex_or_empty(),
                 border: docstyle::compose_border(
