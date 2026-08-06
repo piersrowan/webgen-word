@@ -1051,7 +1051,12 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         clicks.set_propagation_phase(gtk::PropagationPhase::Capture);
         clicks.connect_pressed(move |_, _, x, y| {
             let Some((vx, vy)) = window_to_view(&view, x, y) else { return };
-            sidebar_select(vx, vy);
+            // elementFromPoint speaks CSS-viewport coordinates: widget pixels divided by the
+            // zoom. At 1.0 the two are identical, which is how this hid until zoom shipped —
+            // zoomed in, every hit landed up-left of the click by exactly the zoom factor
+            // (Piers's C5R3-selects-C4R2 report, 2026-08-06).
+            let z = view.zoom_level().max(0.1);
+            sidebar_select(vx / z, vy / z);
         });
         window.add_controller(clicks);
     }

@@ -51,16 +51,29 @@ pub fn check_script(page_px: f64) -> String {
         var el = kids[i];
         if (isBreak(el)) {{ pageTop = el.offsetTop + el.offsetHeight; slack = false; pages++; continue; }}
         if (isSlack(el)) {{ slack = true; continue; }}
+        if (el.offsetHeight === 0) continue; /* hidden or empty: never a reason to break */
         var bottom = el.offsetTop + el.offsetHeight;
         var limit = PAGE * (slack ? 1.10 : 0.94);
         if (bottom - pageTop > limit && el.offsetTop > pageTop) {{
-            var hr = document.createElement("hr");
-            hr.className = "webgen-page-break {auto}";
-            body.insertBefore(hr, el);
-            pageTop = hr.offsetTop + hr.offsetHeight;
+            /* Idempotency is the whole game: a break already sitting immediately above this
+               block means the gate has ALREADY answered here — inserting again every pass is
+               the 173-page runaway (2026-08-06). */
+            var prev = el.previousElementSibling;
+            if (!(prev && isBreak(prev))) {{
+                var hr = document.createElement("hr");
+                hr.className = "webgen-page-break {auto}";
+                body.insertBefore(hr, el);
+                pageTop = hr.offsetTop + hr.offsetHeight;
+                slack = false;
+                inserted++;
+                pages++;
+            }}
+        }}
+        /* A block taller than the page owns its page(s) and overflows honestly: the next
+           measurement starts BELOW it, or everything after it would break one line each. */
+        if (el.offsetHeight > limit) {{
+            pageTop = bottom;
             slack = false;
-            inserted++;
-            pages++;
         }}
     }}
     return inserted + "," + pages;
