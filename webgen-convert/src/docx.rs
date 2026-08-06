@@ -61,6 +61,40 @@ pub fn docx_to_segments(docx: &[u8], asset_dir: &str) -> Result<ConvertedSegment
         table_seq: 0,
     };
 
+    // Header and footer of the default section. They are ordinary block content in their own
+    // parts, with their own rels (the TAFE banner's logo lives in header rels, not the body's),
+    // so each is parsed by a parser primed with THAT part's relationships and media.
+    let mut convert_part = |part_ref: Option<String>| -> String {
+        let Some(id) = part_ref else { return String::new() };
+        let Some(rel) = p.rels.get(&id) else { return String::new() };
+        let target = format!("word/{}", rel.target.trim_start_matches("./"));
+        let Ok(Some(xml)) = read_entry(&mut zip, &target) else { return String::new() };
+        let own_rels = read_entry(&mut zip, &format!(
+            "word/_rels/{}.rels",
+            target.trim_start_matches("word/")
+        ))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        let mut hp = Parser {
+            styles: p.styles.clone(),
+            numbering: p.numbering.clone(),
+            rels: parse_rels(&own_rels),
+            media: p.media.clone(),
+            asset_dir: p.asset_dir.clone(),
+            assets: Vec::new(),
+            notes: Vec::new(),
+            in_field_instruction: false,
+            table_seq: 10_000 + p.table_seq,
+        };
+        let Ok(blocks) = hp.parse_document_from(&xml, b"hdr") else { return String::new() };
+        let html = render_blocks(blocks);
+        p.assets.extend(hp.assets);
+        if html.trim().is_empty() { String::new() } else { html }
+    };
+    let header_html = convert_part(default_part_ref(&document, b"headerReference"));
+    let footer_html = convert_part(default_part_ref(&document, b"footerReference"));
+
     let blocks = p.parse_document(&document)?;
 
     // Fold into segments: maximal runs of paragraphs render together (list nesting spans
@@ -86,6 +120,8 @@ pub fn docx_to_segments(docx: &[u8], asset_dir: &str) -> Result<ConvertedSegment
         segments,
         assets: p.assets,
         notes: p.notes,
+        header_html,
+        footer_html,
         page: parse_sect_pr(&document),
     })
 }
@@ -103,6 +139,29 @@ fn read_entry(
         Err(zip::result::ZipError::FileNotFound) => Ok(None),
         Err(e) => Err(format!("{name}: {e}")),
     }
+}
+
+/// The r:id of the DEFAULT header (or footer) reference in the body's sectPr, if any.
+fn default_part_ref(xml: &[u8], want: &[u8]) -> Option<String> {
+    let mut r = Reader::from_reader(xml);
+    r.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+    let mut found: Option<String> = None;
+    loop {
+        match r.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if local_name(e.name().as_ref()) == want
+                    && attr(&e, "type").as_deref() == Some("default")
+                {
+                    found = attr(&e, "id");
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    found
 }
 
 /// The document's page geometry from the body's `w:sectPr`. Twips (1/1440 inch) throughout;
@@ -416,10 +475,16 @@ enum Block {
 
 impl Parser {
     fn parse_document(&mut self, xml: &[u8]) -> Result<Vec<Block>, String> {
+        self.parse_document_from(xml, b"body")
+    }
+
+    /// Block content of a part whose root wrapper is `end` — `body` for the document, `hdr`/`ftr`
+    /// for headers and footers.
+    fn parse_document_from(&mut self, xml: &[u8], end: &[u8]) -> Result<Vec<Block>, String> {
         let mut r = Reader::from_reader(xml);
         r.config_mut().trim_text(false);
         let mut buf = Vec::new();
-        self.parse_blocks(&mut r, &mut buf, b"body")
+        self.parse_blocks(&mut r, &mut buf, end)
     }
 
     /// Consume block-level content until `</w:{end}>`, returning the blocks in order. Recurses
@@ -1265,6 +1330,57 @@ mod tests {
             &doc(r#"<w:p><w:r><w:t>one two three</w:t></w:r></w:p>"#),
         )]);
         assert_eq!(docx_to_html(&plain, "pics").unwrap().body_html, "<p>one two three</p>");
+    }
+
+    #[test]
+    fn the_default_header_and_footer_come_across() {
+        let rels = concat!(
+            r#"<?xml version="1.0"?><Relationships xmlns="rel">"#,
+            r#"<Relationship Id="rH" Target="header1.xml"/>"#,
+            r#"<Relationship Id="rF" Target="footer1.xml"/>"#,
+            r#"</Relationships>"#
+        );
+        let hdr = r#"<?xml version="1.0"?><w:hdr xmlns:w="w"><w:p><w:r><w:t>TAFE Queensland</w:t></w:r></w:p></w:hdr>"#;
+        let ftr = r#"<?xml version="1.0"?><w:ftr xmlns:w="w"><w:p><w:r><w:t>Page footer</w:t></w:r></w:p></w:ftr>"#;
+        let body = concat!(
+            r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p>"#,
+            r#"<w:sectPr><w:headerReference w:type="even" r:id="rX"/>"#,
+            r#"<w:headerReference w:type="default" r:id="rH"/>"#,
+            r#"<w:footerReference w:type="default" r:id="rF"/></w:sectPr>"#
+        );
+        let d = docx(&[
+            ("word/document.xml", &doc(body)),
+            ("word/_rels/document.xml.rels", rels),
+            ("word/header1.xml", hdr),
+            ("word/footer1.xml", ftr),
+        ]);
+        let out = docx_to_segments(&d, "pics").unwrap();
+        assert_eq!(out.header_html, "<p>TAFE Queensland</p>", "header");
+        assert_eq!(out.footer_html, "<p>Page footer</p>", "footer");
+        // The EVEN-page header is not the default one and must not be picked up by mistake.
+        assert!(!out.header_html.contains("rX"));
+    }
+
+    #[test]
+    fn column_widths_come_from_the_grid() {
+        let body = concat!(
+            r#"<w:tbl><w:tblGrid><w:gridCol w:w="2835"/><w:gridCol w:w="5670"/></w:tblGrid>"#,
+            r#"<w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc>"#,
+            r#"<w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#
+        );
+        let d = docx(&[("word/document.xml", &doc(body))]);
+        let out = docx_to_segments(&d, "pics").unwrap();
+        let crate::Segment::Table(t) = &out.segments[0] else { panic!("expected a table") };
+        // 2835 twips = 50.0mm, 5670 = 100.0mm.
+        assert_eq!(t.col_widths_mm.len(), 2);
+        assert!((t.col_widths_mm[0] - 50.0).abs() < 0.1, "{:?}", t.col_widths_mm);
+        assert!((t.col_widths_mm[1] - 100.0).abs() < 0.1, "{:?}", t.col_widths_mm);
+        // And they reach the markup as scoped rules on a colgroup, never inline styles.
+        let html = render_table_html(t);
+        assert!(html.contains("table-layout: fixed"), "{html}");
+        assert!(html.contains("col.wg-c1 { width: 50.0mm; }"), "{html}");
+        assert!(html.contains("<col class=\"wg-c1\">"), "{html}");
+        assert!(!html.contains("style=\""), "{html}");
     }
 
     #[test]

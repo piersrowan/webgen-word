@@ -199,6 +199,13 @@ li, tr, h1, h2, h3 {{ break-inside: avoid; page-break-inside: avoid; }}
   /* An auto-inserted break (the 94% gate) reads slightly softer than a deliberate one. */
   .{brk}.wg-auto {{ border-top-style: dotted; }}
 }}
+/* An imported document's header and footer, shown once at the top and bottom. A page model is
+   what would repeat them per sheet, and HTML has none — so they are marked, separated and
+   honest rather than pretending. */
+.wg-doc-header {{ margin-bottom: 6mm; padding-bottom: 3mm; border-bottom: 0.5pt solid {rule}; }}
+.wg-doc-footer {{ margin-top: 6mm; padding-top: 3mm; border-top: 0.5pt solid {rule}; }}
+.wg-doc-header p, .wg-doc-footer p {{ margin: 0 0 1mm 0; }}
+
 /* The slack marker: let this page run long. Screen-only — it changes where the AUTO gate
    fires, it is not itself a break, and print must never show it. */
 .wg-page-slack {{ border: 0; height: 0; }}

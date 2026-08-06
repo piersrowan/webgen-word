@@ -2067,6 +2067,17 @@ fn convert_docx(
     let out = webgen_convert::docx_to_segments(&bytes, &folder).map_err(|e| e.to_string())?;
 
     let mut body = String::new();
+    // The document's header and footer, once at the top and once at the bottom. HTML has no page
+    // model — WebKit's print path supports no @page margin boxes — so per-page repetition is not
+    // expressible; showing them once is honest and puts the banner and logo back (Piers,
+    // 2026-08-06: "do 1 now"). Marked with their own classes so a stylesheet can hide or restyle
+    // them, and so a later docx export can put them back where they came from.
+    if mode != ConvertMode::Plain && !out.header_html.trim().is_empty() {
+        body.push_str(&format!(
+            "<div class=\"wg-doc-header\">{}</div>\n",
+            out.header_html
+        ));
+    }
     let mut native_id = 0u32;
     for seg in out.segments {
         match seg {
@@ -2092,6 +2103,13 @@ fn convert_docx(
                 }
             }
         }
+    }
+
+    if mode != ConvertMode::Plain && !out.footer_html.trim().is_empty() {
+        body.push_str(&format!(
+            "<div class=\"wg-doc-footer\">{}</div>\n",
+            out.footer_html
+        ));
     }
 
     if !out.assets.is_empty() {

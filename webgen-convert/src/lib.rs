@@ -43,6 +43,11 @@ pub struct ConvertedSegments {
     pub segments: Vec<Segment>,
     pub assets: Vec<(String, Vec<u8>)>,
     pub notes: Vec<String>,
+    /// The default section's header and footer, converted to HTML (empty when the document has
+    /// none, or when the part is blank). Rendered ONCE at the top and bottom of the document:
+    /// HTML has no page model, so per-page repetition is not expressible — see the module note.
+    pub header_html: String,
+    pub footer_html: String,
     /// The document's OWN page geometry from `w:sectPr`, in millimetres. Ignoring it was why a
     /// converted form printed to more pages than Word or LibreOffice give it: the app's A4/20mm
     /// default is narrower than the ~15/12/9mm these templates actually use, so ~25% less content
