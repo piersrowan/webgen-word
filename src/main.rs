@@ -1294,6 +1294,41 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     }
     menu.append_submenu(Some("Table"), &table_section);
 
+    // --- tasks (optional; see the note on the helper below) ------------------------------------
+    // The whole integration: if `webgen-tasks` is not installed, this menu item is never built,
+    // so the feature simply is not there. No dependency on Email, nothing to fail at runtime —
+    // Piers's MacBurger rule, applied here first because Word is what he is using today.
+    if tasks_available() {
+        let tasks_section = gtk::gio::Menu::new();
+        tasks_section.append(Some("Add a task for this document"), Some(&action(&window, "add-task", {
+            let state = state.clone();
+            let say = say.clone();
+            let window = window.clone();
+            move || {
+                let (path, setup) = {
+                    let s = state.borrow();
+                    (s.path.clone(), s.setup)
+                };
+                let name = doc_title(&path);
+                let payload = serde_json::json!({
+                    "title": format!("Document: {name}"),
+                    "app": "word",
+                    "path": path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    "document_name": name,
+                    "paper": setup.paper.label(),
+                })
+                .to_string();
+                match add_task(&payload) {
+                    Ok(true) => say("Added to your tasks."),
+                    // Uninstalled between building the menu and clicking it: say so plainly.
+                    Ok(false) => say("Tasks is not installed on this machine."),
+                    Err(e) => error_dialog(&window, "Could not add the task", &e),
+                }
+            }
+        })));
+        menu.append_section(None, &tasks_section);
+    }
+
     // --- calculations -------------------------------------------------------------------------
     let calc_section = gtk::gio::Menu::new();
     calc_section.append(Some("Recalculate"), Some(&action(&window, "recalculate", {
@@ -2055,6 +2090,36 @@ fn unpack_wgz(archive: &Path) -> Result<(PathBuf, PathBuf), String> {
         }
     }
     document.map(|d| (d, target)).ok_or_else(|| "there is no document inside it".to_string())
+}
+
+/// Is the Tasks tool installed?
+///
+/// Deliberately a PATH probe rather than a crate dependency: Tasks ships with Email, and Word must
+/// not depend on the mail client (nor MacBurger, nor anything else) to compile or to run. The
+/// contract between apps is a binary and a JSON payload — see webgen-tasks' own documentation.
+fn tasks_available() -> bool {
+    which_tasks().is_some()
+}
+
+fn which_tasks() -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|d| d.join("webgen-tasks"))
+        .find(|p| p.is_file())
+}
+
+/// Hand a task to the Tasks tool. `Ok(false)` means it is not installed, which is not an error.
+fn add_task(payload: &str) -> Result<bool, String> {
+    let Some(bin) = which_tasks() else { return Ok(false) };
+    let out = std::process::Command::new(bin)
+        .args(["add", "--json", payload])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(true)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 fn is_docx(path: &Path) -> bool {
