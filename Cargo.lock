@@ -924,10 +924,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "webgen-calc"
-version = "0.1.0"
-
-[[package]]
 name = "webgen-convert"
 version = "0.1.0"
 dependencies = [
@@ -944,6 +940,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "webgen-sheet"
+version = "0.1.0"
+
+[[package]]
 name = "webgen-swatch"
 version = "0.3.0"
 source = "git+ssh://git@github.com/piersrowan/webgen-swatch.git?rev=db339d9d80255ed4952cdfd4706518aee50051c3#db339d9d80255ed4952cdfd4706518aee50051c3"
@@ -955,15 +955,15 @@ dependencies = [
 
 [[package]]
 name = "webgen-word"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "gtk4",
  "libadwaita",
  "serde",
  "serde_json",
- "webgen-calc",
  "webgen-convert",
  "webgen-registry",
+ "webgen-sheet",
  "webgen-swatch",
  "webkit6",
 ]

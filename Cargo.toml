@@ -1,9 +1,9 @@
 [workspace]
-members = ["webgen-convert", "webgen-calc"]
+members = ["webgen-convert", "webgen-sheet"]
 
 [package]
 name = "webgen-word"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2021"
 license = "MIT"
 authors = ["webgen <piers.rowan@webgen.com.au>"]
@@ -40,8 +40,9 @@ webgen-swatch = { git = "ssh://git@github.com/piersrowan/webgen-swatch.git", rev
 # $format -> HTML (docx today). An in-repo path dep — unlike webgen-registry above, it lives in
 # THIS tree, so it survives `cargo vendor` with the tree and needs no git pin.
 webgen-convert = { path = "webgen-convert" }
-# The calculation engine (HYBRID.md). Its own crate so CalcSheet can use it without Word.
-webgen-calc = { path = "webgen-calc" }
+# The calculation engine (HYBRID.md). Its own crate so the coming webgen-sheets app can use it
+# without Word. NOT named webgen-calc: that repo is the calculator (Piers, 2026-08-07).
+webgen-sheet = { path = "webgen-sheet" }
 
 [profile.release]
 opt-level = 2

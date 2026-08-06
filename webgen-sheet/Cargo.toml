@@ -1,11 +1,11 @@
 [package]
-name = "webgen-calc"
+name = "webgen-sheet"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["webgen <piers.rowan@webgen.com.au>"]
 rust-version = "1.80"
-description = "webgen-calc -- the document calculation engine: named columns, out-of-band constants, aggregates"
+description = "webgen-sheet -- the document calculation engine (the sheet behind a document table): named columns, out-of-band constants, aggregates"
 
 # No dependencies, deliberately. This is arithmetic over a table; anything it pulled in would be
 # a liability in a document format that has to open on someone else's machine in ten years.

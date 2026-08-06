@@ -1,6 +1,6 @@
 //! Recalculating a document's tables.
 //!
-//! The bridge between the table model (`table.rs`) and the calculation engine (`webgen-calc`).
+//! The bridge between the table model (`table.rs`) and the calculation engine (`webgen-sheet`).
 //! Piers's rule from HYBRID.md holds throughout: **the values live in the document as text**, so
 //! a recipient with no WebGen, no JavaScript and no calculator still reads the right numbers.
 //! Formulas are the recipe; the text is the meal.
@@ -18,7 +18,7 @@
 
 use crate::table::{Cell, Table};
 use std::collections::HashMap;
-use webgen_calc::{name_of, Column, Sheet, Value};
+use webgen_sheet::{name_of, Column, Sheet, Value};
 
 /// Gather `$$name` → value from a rates table: any row of two-or-more cells whose first cell is
 /// text and whose second is a number.
@@ -240,6 +240,30 @@ mod tests {
         recalculate(&mut pay, &constants);
         let after: f64 = pay.body[0][13].text.parse().unwrap();
         assert!(after > before, "net pay should follow the rate: {before} -> {after}");
+    }
+
+    #[test]
+    fn the_example_survives_the_document_round_trip_recalculate_makes() {
+        // Recalculate reads tables back out of the DOM: block -> data-wg-table attribute ->
+        // unescape -> from_json. If formulas do not survive that, the menu says "no table carries
+        // a formula" while the document plainly has one (Piers, 2026-08-07).
+        let (rates, pay) = payroll_example(1);
+        for t in [&rates, &pay] {
+            let block = t.to_block();
+            let start = block.find("data-wg-table=\"").expect("attribute") + 15;
+            let end = block[start..].find('"').expect("attribute end") + start;
+            let json = crate::table::unescape_attr(&block[start..end]);
+            let back = crate::table::Table::from_json(&json).expect("parses back");
+            assert_eq!(&back, t, "the model must survive the trip");
+        }
+        assert!(has_formulas(&crate::table::Table::from_json(
+            &crate::table::unescape_attr({
+                let block = pay.to_block();
+                let start = block.find("data-wg-table=\"").unwrap() + 15;
+                let end = block[start..].find('"').unwrap() + start;
+                &block[start..end].to_string()
+            })
+        ).unwrap()), "formulas must be visible to Recalculate");
     }
 
     #[test]
