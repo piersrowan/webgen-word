@@ -12,6 +12,8 @@
 //! columns, floating frames — is out of scope; that is what LibreOffice remains installed for.
 
 mod docx;
+pub mod from_html;
+pub mod to_docx;
 
 pub use docx::{docx_to_html, docx_to_segments, render_table_html};
 

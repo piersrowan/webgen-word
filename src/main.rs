@@ -1392,6 +1392,72 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             });
         }
     })));
+    export_section.append(Some("Save a copy as Word (.docx)…"), Some(&action(&window, "export-docx", {
+        let (window, state, say) = (window.clone(), state.clone(), say.clone());
+        let read_document = read_document.clone();
+        move || {
+            let initial = state
+                .borrow()
+                .path
+                .as_ref()
+                .and_then(|p| p.file_stem().map(|s| format!("{}.docx", s.to_string_lossy())))
+                .unwrap_or_else(|| "document.docx".into());
+            let (state, say, read_document) = (state.clone(), say.clone(), read_document.clone());
+            ask_for_path(&window, "Save a copy as Word", "Word document", &["*.docx"], &initial, move |p| {
+                let target = with_extension(p, "docx");
+                let setup = state.borrow().setup;
+                // Pictures come from the document's own folder, resolved the same way the sanitiser
+                // resolves them: beside the file it was loaded from.
+                let source_dir = state.borrow().path.as_ref().and_then(|d| d.parent().map(|x| x.to_path_buf()));
+                let say = say.clone();
+                read_document(Rc::new(move |html: String| {
+                    let parsed = webgen_convert::from_html::parse(&html);
+                    let mut media = std::collections::HashMap::new();
+                    if let Some(dir) = &source_dir {
+                        // The pictures folder is `<stem>_files`; a name that escapes it is refused
+                        // rather than followed.
+                        for name in &parsed.images {
+                            if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+                                continue;
+                            }
+                            let mut found = None;
+                            if let Ok(entries) = std::fs::read_dir(dir) {
+                                for e in entries.flatten() {
+                                    let candidate = e.path().join(name);
+                                    if candidate.is_file() {
+                                        found = std::fs::read(&candidate).ok();
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(bytes) = found {
+                                media.insert(name.clone(), bytes);
+                            }
+                        }
+                    }
+                    let page = webgen_convert::to_docx::PageOut {
+                        width_mm: setup.paper.width_mm(),
+                        height_mm: setup.paper.height_mm(),
+                        top_mm: setup.top,
+                        right_mm: setup.right,
+                        bottom_mm: setup.bottom,
+                        left_mm: setup.left,
+                    };
+                    match webgen_convert::to_docx::write_docx(&parsed.nodes, &media, page)
+                        .and_then(|bytes| std::fs::write(&target, bytes).map_err(|e| e.to_string()))
+                    {
+                        Ok(()) => say(&format!(
+                            "Saved {} — {} block(s), {} picture(s).",
+                            target.display(),
+                            parsed.nodes.len(),
+                            media.len()
+                        )),
+                        Err(e) => say(&format!("Could not write {}: {e}", target.display())),
+                    }
+                }));
+            });
+        }
+    })));
     export_section.append(Some("Save a copy as .wgz…"), Some(&action(&window, "export-wgz", {
         let (window, state, say) = (window.clone(), state.clone(), say.clone());
         let read_document = read_document.clone();

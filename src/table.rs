@@ -1086,7 +1086,7 @@ mod tests {
     fn fill_numbering_respects_spans_above_and_beside() {
         // Body-only table: r1c1 spans 2 rows, so the second row's first LISTED cell sits at c2;
         // give it a fill and the class must say r2_c2, not r2_c1.
-        let mut table = Table { id: 9, head: Vec::new(), body: vec![
+        let mut table = Table { id: 9, cols: Vec::new(), head: Vec::new(), body: vec![
             vec![Cell { rowspan: 2, ..Cell::with_text("tall") }, Cell::with_text("a")],
             vec![Cell { fill: "#eee".into(), ..Cell::with_text("shifted") }],
         ], foot: Vec::new(), css: Default::default() };
