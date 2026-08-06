@@ -742,10 +742,22 @@ pub fn cursor_script() -> String {
 }
 
 /// Put the cursor on whatever is at these viewport coordinates, and describe it.
-pub fn select_at_script(x: f64, y: f64) -> String {
+pub fn select_at_script(x: f64, y: f64, view_w: i32, view_h: i32) -> String {
     format!(
-        "(function (x, y) {{
+        "(function (x, y, vw, vh) {{
            window.wgCursor.clear();
+           /* Widget pixels are NOT CSS pixels. Measured on the Acer (2026-08-07): a 980x665
+              WebView showing a 1159x786 CSS viewport — devicePixelRatio 0.845 — so a widget
+              coordinate handed straight to elementFromPoint lands up and to the LEFT by ~18%,
+              and the rightmost sixth of the document cannot be hit at all. That was Piers's
+              \"click down and to the right to select the cell\".
+              Scaling by the viewport-to-widget ratio (rather than by devicePixelRatio, or by the
+              zoom level as an earlier fix wrongly did) covers BOTH causes at once: innerWidth
+              already reflects display scaling and WebKit's zoom together. */
+           const sx = vw > 0 ? window.innerWidth / vw : 1;
+           const sy = vh > 0 ? window.innerHeight / vh : 1;
+           x = x * sx;
+           y = y * sy;
            let el = document.elementFromPoint(x, y);
            /* elementFromPoint misses when the click landed on a text node's whitespace; the
               selection anchor is where the caret actually went. */
@@ -757,7 +769,7 @@ pub fn select_at_script(x: f64, y: f64) -> String {
            if (!el || el === document.documentElement || el.tagName === 'BODY') return '';
            el.classList.add('{cursor}');
            return window.wgCursor.describe();
-         }})({x}, {y})",
+         }})({x}, {y}, {view_w}, {view_h})",
         cursor = CURSOR_CLASS,
     )
 }
@@ -790,6 +802,44 @@ pub fn claim_instance_script(class: &str) -> String {
            if (existing) return existing;
            el.classList.add(minted);
            return '.' + minted;
+         }})({class})",
+        class = crate::js::string(class),
+    )
+}
+
+/// Put ONE shared class on every cell inside the selected element and return its selector.
+///
+/// Piers, 2026-08-07: *"If I hilight a row and add a border then every cell selected (not
+/// focussed) should get a border."* Selecting a row and styling it put the border on the `<tr>`,
+/// where a border does almost nothing — the user meant the cells. A row is a container; the thing
+/// with edges is the cell.
+///
+/// One class across several elements rather than a compound selector, deliberately: the document
+/// format (shared with the browser's editor, CONTRACT §4c) admits a single class or tag per rule,
+/// and a class is allowed on as many elements as it likes. So this stays inside the format while
+/// meaning "these cells, together".
+pub fn claim_cells_script(class: &str) -> String {
+    format!(
+        "(function (minted) {{
+           const el = window.wgCursor.el();
+           if (!el) return '';
+           const cells = el.querySelectorAll('td, th');
+           if (!cells.length) return '';
+           // Reuse a shared class the cells ALREADY agree on, so styling the same row twice
+           // edits one rule instead of accumulating a new one each time.
+           let shared = '';
+           const first = cells[0];
+           for (const c of first.classList) {{
+             if (!/^wg-i[0-9]+$/.test(c)) continue;
+             let all = true;
+             cells.forEach(function (cell) {{ if (!cell.classList.contains(c)) all = false; }});
+             if (all) {{ shared = c; break; }}
+           }}
+           if (!shared) {{
+             shared = minted;
+             cells.forEach(function (cell) {{ cell.classList.add(minted); }});
+           }}
+           return '.' + shared;
          }})({class})",
         class = crate::js::string(class),
     )

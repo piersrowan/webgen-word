@@ -160,6 +160,17 @@ pub fn build(
     scope.append(&all_b);
     scope.append(&one_b);
 
+    // "Apply to the cells inside" — the fix for styling a ROW and having nothing visible happen
+    // (Piers, 2026-08-07). Only meaningful on a container that holds cells, so it is enabled by
+    // `show_selected` and ignored everywhere else.
+    let cells_b = gtk::CheckButton::with_label("Apply to the cells inside");
+    cells_b.set_tooltip_text(Some(
+        "Style every cell in the selected row, section or table, rather than the container itself",
+    ));
+    cells_b.set_margin_start(10);
+    cells_b.set_margin_end(10);
+    cells_b.set_margin_top(6);
+
     let scope_note = gtk::Label::new(None);
     scope_note.add_css_class("dim-label");
     scope_note.add_css_class("caption");
@@ -311,6 +322,7 @@ pub fn build(
     body.add_named(&hint, Some("hint"));
     let editing = gtk::Box::new(gtk::Orientation::Vertical, 0);
     editing.append(&scope);
+    editing.append(&cells_b);
     editing.append(&scope_note);
     editing.append(&scroller);
     editing.append(&buttons);
@@ -469,6 +481,7 @@ pub fn build(
         let ui = ui.clone();
         let (title, up, down, all_b, one_b, body, scope_note) =
             (title.clone(), up.clone(), down.clone(), all_b.clone(), one_b.clone(), body.clone(), scope_note.clone());
+        let cells_b = cells_b.clone();
         let load_rows = load_rows.clone();
         Rc::new(move |selected: Option<Selected>| {
             let Some(s) = selected else {
@@ -483,6 +496,13 @@ pub fn build(
 
             // "All instances" is only expressible for a tag the format can carry. Anything else —
             // a <main>, a <label> — can still be styled, but only as itself.
+            // Containers of cells: styling one of these almost always means the cells.
+            let container = matches!(s.tag.as_str(), "tr" | "thead" | "tbody" | "tfoot" | "table");
+            cells_b.set_sensitive(container);
+            if !container {
+                cells_b.set_active(false);
+            }
+
             let taggable = docstyle::STYLEABLE_TAGS.contains(&s.tag.as_str());
             all_b.set_sensitive(taggable);
             all_b.set_label(&format!("All <{}>", s.tag));
@@ -557,18 +577,26 @@ pub fn build(
         let ui = ui.clone();
         let collect = collect.clone();
         let show_selected = show_selected.clone();
+        let cells_apply = cells_b.clone();
         apply_b.connect_clicked(move |_| {
             let style = collect();
             let Some(selected) = ui.selected.borrow().clone() else { return };
             let before = ui.state.borrow().custom.clone();
 
-            if ui.instance_scope.get() {
-                // This element alone. Mint it a handle if it has none, then write the override.
+            // "Apply to the cells inside" wins over the scope toggle: it is a more specific
+            // statement of intent than "this one" vs "all of them".
+            let to_cells = cells_apply.is_active() && cells_apply.is_sensitive();
+            if ui.instance_scope.get() || to_cells {
+                // This element alone — or every cell inside it, sharing one class.
                 let minted = docstyle::next_instance_class(&before, selected.highest_instance);
                 let ui2 = ui.clone();
                 let show_selected = show_selected.clone();
                 ui.view.evaluate_javascript(
-                    &docstyle::claim_instance_script(&minted),
+                    &if to_cells {
+                        docstyle::claim_cells_script(&minted)
+                    } else {
+                        docstyle::claim_instance_script(&minted)
+                    },
                     None,
                     None,
                     gtk::gio::Cancellable::NONE,
@@ -640,11 +668,13 @@ pub fn build(
     let select_at: Rc<dyn Fn(f64, f64)> = {
         let root = root.clone();
         let refresh_from = refresh_from.clone();
+        let view = view.clone();
         Rc::new(move |x: f64, y: f64| {
             if !root.reveals_child() {
                 return;
             }
-            refresh_from(docstyle::select_at_script(x, y));
+            // The widget's own size, so the script can scale widget pixels into CSS pixels.
+            refresh_from(docstyle::select_at_script(x, y, view.width(), view.height()));
         })
     };
 
