@@ -1334,56 +1334,11 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     calc_section.append(Some("Recalculate"), Some(&action(&window, "recalculate", {
         let view = view.clone();
         let say = say.clone();
-        move || {
-            let view2 = view.clone();
-            let say = say.clone();
-            view.evaluate_javascript(
-                &table::all_tables_script(),
-                None,
-                None,
-                gtk::gio::Cancellable::NONE,
-                move |res| {
-                    let blob = res.map(|v| v.to_str().to_string()).unwrap_or_default();
-                    let tables: Vec<table::Table> = blob
-                        .lines()
-                        .filter_map(|j| table::Table::from_json(&table::unescape_attr(j)))
-                        .collect();
-                    if tables.is_empty() {
-                        say("No tables to calculate.");
-                        return;
-                    }
-                    // Constants come from the tables WITHOUT formulas — the rates live in their
-                    // own little table, which is exactly Piers's out-of-band $$ reference.
-                    let plain: Vec<table::Table> =
-                        tables.iter().filter(|t| !recalc::has_formulas(t)).cloned().collect();
-                    let constants = recalc::constants_from(&plain);
-                    let mut changed = 0;
-                    let mut done = 0;
-                    for mut t in tables.into_iter().filter(|t| recalc::has_formulas(t)) {
-                        let n = recalc::recalculate(&mut t, &constants);
-                        if n > 0 {
-                            changed += n;
-                            done += 1;
-                            view2.evaluate_javascript(
-                                &table::replace_block_script(&t.class(), &t.to_block()),
-                                None,
-                                None,
-                                gtk::gio::Cancellable::NONE,
-                                |_| {},
-                            );
-                        }
-                    }
-                    if done == 0 {
-                        say("Nothing to recalculate — no table carries a formula.");
-                    } else {
-                        say(&format!(
-                            "Recalculated {done} table(s): {changed} value(s), {} constant(s).",
-                            constants.len()
-                        ));
-                    }
-                },
-            );
-        }
+        move || recalculate_document(&view, &say)
+    })));
+    calc_section.append(Some("Formula for this column…"), Some(&action(&window, "calc-formula", {
+        let (view, window, say) = (view.clone(), window.clone(), say.clone());
+        move || formula_dialog(&window, &view, &say)
     })));
     calc_section.append(Some("Insert payroll example"), Some(&action(&window, "calc-example", {
         let view = view.clone();
@@ -1876,6 +1831,235 @@ fn table_op(view: &webkit6::WebView, say: &Rc<impl Fn(&str) + 'static>, op: Tabl
                     say2(done);
                 }
             });
+        },
+    );
+}
+
+/// Recalculate every table in the document that carries a formula.
+///
+/// The status line distinguishes three outcomes that used to be reported as one. A table whose
+/// values are ALREADY right changes nothing, and reporting that as "no table carries a formula"
+/// told the reader something false about their own document — which is what Piers hit the first
+/// time he tried it: insert the payroll example (which arrives calculated), press Recalculate, and
+/// be told the formulas were not there. "Nothing changed" and "nothing to do" are different
+/// answers and the reader needs to be able to tell them apart.
+fn recalculate_document(view: &webkit6::WebView, say: &Rc<impl Fn(&str) + 'static>) {
+    let view2 = view.clone();
+    let say = say.clone();
+    view.evaluate_javascript(
+        &table::all_tables_script(),
+        None,
+        None,
+        gtk::gio::Cancellable::NONE,
+        move |res| {
+            let blob = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+            let tables: Vec<table::Table> = blob
+                .lines()
+                .filter_map(|j| table::Table::from_json(&table::unescape_attr(j)))
+                .collect();
+            if tables.is_empty() {
+                say("No tables to calculate.");
+                return;
+            }
+            // Constants come from the tables WITHOUT formulas — the rates live in their own little
+            // table, which is exactly Piers's out-of-band $$ reference.
+            let plain: Vec<table::Table> =
+                tables.iter().filter(|t| !recalc::has_formulas(t)).cloned().collect();
+            let constants = recalc::constants_from(&plain);
+            let mut changed = 0;
+            let mut with_formulas = 0;
+            let mut rewritten = 0;
+            for mut t in tables.into_iter().filter(|t| recalc::has_formulas(t)) {
+                with_formulas += 1;
+                let n = recalc::recalculate(&mut t, &constants);
+                if n > 0 {
+                    changed += n;
+                    rewritten += 1;
+                    view2.evaluate_javascript(
+                        &table::replace_block_script(&t.class(), &t.to_block()),
+                        None,
+                        None,
+                        gtk::gio::Cancellable::NONE,
+                        |_| {},
+                    );
+                }
+            }
+            let s = |n: usize| if n == 1 { "" } else { "s" };
+            if with_formulas == 0 {
+                say("Nothing to recalculate — no table carries a formula. \
+                     Put the cursor in a table and use “Formula for this column…”.");
+            } else if changed == 0 {
+                say(&format!(
+                    "Checked {with_formulas} table{} — every value was already up to date.",
+                    s(with_formulas)
+                ));
+            } else {
+                say(&format!(
+                    "Recalculated {rewritten} table{}: {changed} value{} from {} constant{}.",
+                    s(rewritten),
+                    s(changed),
+                    constants.len(),
+                    s(constants.len())
+                ));
+            }
+        },
+    );
+}
+
+/// Give the column the caret is in a formula.
+///
+/// Without this there is no way to AUTHOR a formula in a document — Recalculate could only ever act
+/// on the built-in example, which is why it looked broken. Formulas are per-column because that is
+/// how the engine and the brief both work: every row of a column runs the same recipe.
+fn formula_dialog(
+    window: &adw::ApplicationWindow,
+    view: &webkit6::WebView,
+    say: &Rc<impl Fn(&str) + 'static>,
+) {
+    let (view2, window, say) = (view.clone(), window.clone(), say.clone());
+    view.evaluate_javascript(
+        &table::find_cell_at_cursor_script(),
+        None,
+        None,
+        gtk::gio::Cancellable::NONE,
+        move |res| {
+            let found = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+            let mut parts = found.splitn(4, '|');
+            let (Some(section), Some(row), Some(index), Some(json)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                say("Put the cursor in a table cell first.");
+                return;
+            };
+            let (row, index) =
+                (row.parse::<usize>().unwrap_or(0), index.parse::<usize>().unwrap_or(0));
+            let Some(table) = table::Table::from_json(&table::unescape_attr(json)) else {
+                say("That table's data could not be read — nothing was changed.");
+                return;
+            };
+            let grid = table::Grid::of(match section {
+                "head" => &table.head,
+                "foot" => &table.foot,
+                _ => &table.body,
+            });
+            let col = grid
+                .cells
+                .iter()
+                .find(|c| c.row == row && c.index == index)
+                .map(|c| c.col)
+                .unwrap_or(0);
+
+            let names = recalc::column_names(&table);
+            let heading = names.get(col).cloned().unwrap_or_default();
+            // What the column already computes, if anything.
+            let totals = recalc::totals_row(&table);
+            let existing = table
+                .body
+                .iter()
+                .enumerate()
+                .filter(|(r, _)| Some(*r) != totals)
+                .filter_map(|(_, r)| r.get(col))
+                .map(|c| c.formula.clone())
+                .find(|f| !f.is_empty())
+                .unwrap_or_default();
+
+            let dialog = adw::Window::builder()
+                .transient_for(&window)
+                .modal(true)
+                .title("Column formula")
+                .default_width(520)
+                .build();
+
+            let group = adw::PreferencesGroup::new();
+            group.set_title(&if heading.is_empty() {
+                format!("Column {}", col + 1)
+            } else {
+                format!("${heading}")
+            });
+            group.set_description(Some(
+                "Every row of this column runs the same formula. Refer to another column by \
+                 $its_heading and to a rate in a two-column table by $$its_label. \
+                 Leave it empty to make the column ordinary text again.",
+            ));
+
+            let entry = adw::EntryRow::new();
+            entry.set_title("Formula");
+            entry.set_text(&existing);
+            group.add(&entry);
+
+            let hints = gtk::Label::new(Some(&if names.is_empty() {
+                "This table has no heading row, so there are no $names to refer to.".to_string()
+            } else {
+                format!(
+                    "Columns here: {}",
+                    names.iter().map(|n| format!("${n}")).collect::<Vec<_>>().join(", ")
+                )
+            }));
+            hints.set_wrap(true);
+            hints.set_xalign(0.0);
+            hints.add_css_class("dim-label");
+            hints.add_css_class("caption");
+
+            let cancel = gtk::Button::with_label("Cancel");
+            let apply = gtk::Button::with_label("Apply and recalculate");
+            apply.add_css_class("suggested-action");
+            {
+                let dialog = dialog.clone();
+                cancel.connect_clicked(move |_| dialog.close());
+            }
+            {
+                let (dialog, view2, say, entry) =
+                    (dialog.clone(), view2.clone(), say.clone(), entry.clone());
+                let table = table.clone();
+                apply.connect_clicked(move |_| {
+                    let formula = entry.text().trim().to_string();
+                    // The clicked handler is an `Fn`, so the edit works on a copy taken per click:
+                    // pressing Apply twice must not compound.
+                    let mut table = table.clone();
+                    let set = recalc::set_column_formula(&mut table, col, &formula);
+                    dialog.close();
+                    if set == 0 {
+                        say("That column already had that formula — nothing was changed.");
+                        return;
+                    }
+                    let (view3, say2) = (view2.clone(), say.clone());
+                    view2.evaluate_javascript(
+                        &table::replace_block_script(&table.class(), &table.to_block()),
+                        None,
+                        None,
+                        gtk::gio::Cancellable::NONE,
+                        move |r| {
+                            if r.map(|v| v.to_str().to_string()).unwrap_or_default().is_empty() {
+                                say2("The table could not be updated — nothing was changed.");
+                            } else {
+                                // Applying a formula and then leaving the numbers stale would be
+                                // the same silent no-op this whole change exists to remove.
+                                recalculate_document(&view3, &say2);
+                            }
+                        },
+                    );
+                });
+            }
+
+            let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            buttons.set_halign(gtk::Align::End);
+            buttons.append(&cancel);
+            buttons.append(&apply);
+
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
+            content.set_margin_top(16);
+            content.set_margin_bottom(16);
+            content.set_margin_start(16);
+            content.set_margin_end(16);
+            content.append(&group);
+            content.append(&hints);
+            content.append(&buttons);
+
+            let bar = adw::ToolbarView::new();
+            bar.add_top_bar(&adw::HeaderBar::new());
+            bar.set_content(Some(&content));
+            dialog.set_content(Some(&bar));
+            dialog.present();
         },
     );
 }

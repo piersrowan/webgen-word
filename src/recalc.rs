@@ -47,6 +47,48 @@ pub fn has_formulas(t: &Table) -> bool {
     t.body.iter().chain(t.foot.iter()).flatten().any(|c| !c.formula.is_empty())
 }
 
+/// The index of the totals row, if the last body row carries aggregates. One definition, used both
+/// when calculating and when the formula editor decides what a new formula applies to — so the row
+/// that must not be summed into itself cannot be identified two different ways.
+pub fn totals_row(t: &Table) -> Option<usize> {
+    let last = t.body.len().checked_sub(1)?;
+    let aggregate = t.body[last].iter().any(|c| {
+        let f = c.formula.to_ascii_uppercase();
+        f.contains("SUM(") || f.contains("AVG(")
+    });
+    aggregate.then_some(last)
+}
+
+/// Set a column's formula on every data row, leaving the totals row alone. An empty formula clears
+/// it, which turns the column back into one you type into. Returns how many cells were set.
+pub fn set_column_formula(t: &mut Table, col: usize, formula: &str) -> usize {
+    let totals = totals_row(t);
+    let mut set = 0;
+    for r in 0..t.body.len() {
+        if Some(r) == totals {
+            continue;
+        }
+        if let Some(cell) = t.body[r].get_mut(col) {
+            if cell.formula != formula {
+                cell.formula = formula.to_string();
+                set += 1;
+            }
+            // A cleared formula leaves the last calculated value behind as ordinary text, which is
+            // the honest thing: the number was true when it was written, and HYBRID.md's rule is
+            // that the document's text is what a reader without WebGen sees.
+        }
+    }
+    set
+}
+
+/// The `$name` a formula refers to a column by — what the editor offers as hints.
+pub fn column_names(t: &Table) -> Vec<String> {
+    t.head
+        .first()
+        .map(|row| row.iter().map(|c| name_of(&c.text)).filter(|n| !n.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 /// Recalculate one table in place. Returns how many cells changed.
 pub fn recalculate(t: &mut Table, constants: &HashMap<String, f64>) -> usize {
     if t.head.is_empty() || t.body.is_empty() {
@@ -59,9 +101,7 @@ pub fn recalculate(t: &mut Table, constants: &HashMap<String, f64>) -> usize {
 
     // A trailing row of aggregates is the totals row, and must not be summed into itself.
     let last = t.body.len() - 1;
-    let totals_row = t.body[last]
-        .iter()
-        .any(|c| c.formula.to_ascii_uppercase().contains("SUM(") || c.formula.to_ascii_uppercase().contains("AVG("));
+    let totals_row = totals_row(t).is_some();
     let data_rows = if totals_row { last } else { t.body.len() };
 
     // A column's formula is whichever formula its data cells carry (they agree in practice; the
@@ -264,6 +304,44 @@ mod tests {
                 &block[start..end].to_string()
             })
         ).unwrap()), "formulas must be visible to Recalculate");
+    }
+
+    #[test]
+    fn an_already_correct_table_still_reports_as_carrying_formulas() {
+        // The bug Piers hit: "Insert payroll example" arrives CALCULATED, so a Recalculate that
+        // followed it changed nothing — and the menu reported "no table carries a formula", which
+        // is false. Nothing-changed must never be mistaken for nothing-to-do.
+        let (rates, mut pay) = payroll_example(1);
+        let constants = constants_from(&[rates]);
+        recalculate(&mut pay, &constants);
+        assert_eq!(recalculate(&mut pay, &constants), 0, "a second pass changes nothing");
+        assert!(has_formulas(&pay), "and the formulas are still plainly there");
+    }
+
+    #[test]
+    fn a_column_formula_is_authored_across_the_data_rows_only() {
+        let (rates, mut pay) = payroll_example(1);
+        assert_eq!(totals_row(&pay), Some(10), "the last row aggregates");
+        // Overwrite Super Amount with a different rule; the totals row keeps its SUM.
+        let set = set_column_formula(&mut pay, 2, "$pay_rate * 2");
+        assert_eq!(set, 10, "ten data rows, not the totals row");
+        assert_eq!(pay.body[10][1].formula, "SUM($hours)", "the total is untouched");
+
+        recalculate(&mut pay, &constants_from(&[rates]));
+        let super_amount: f64 = pay.body[0][2].text.parse().unwrap();
+        assert!((super_amount - 55.0).abs() < 1e-4, "27.50 * 2, got {super_amount}");
+
+        // Clearing it leaves the last value as ordinary text rather than blanking the document.
+        assert_eq!(set_column_formula(&mut pay, 2, ""), 10);
+        assert!(!pay.body[0][2].text.is_empty());
+        assert!(pay.body[0][2].formula.is_empty());
+    }
+
+    #[test]
+    fn a_table_with_no_aggregates_has_no_totals_row() {
+        let (rates, _) = payroll_example(1);
+        assert_eq!(totals_row(&rates), None, "a rates table is all data");
+        assert_eq!(column_names(&rates), vec!["rate", "value"]);
     }
 
     #[test]
