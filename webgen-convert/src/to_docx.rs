@@ -49,6 +49,9 @@ pub struct Run {
     pub link: Option<String>,
     /// An image: the media file name it was written as.
     pub image: Option<String>,
+    /// Its size in EMUs, when the document knows it. Without this an exported picture is a guess,
+    /// and a guessed logo lands cropped (2026-08-06).
+    pub image_emu: Option<(i64, i64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -282,12 +285,14 @@ fn write_run(
             }
             let id = format!("rIdImg{}", rels.len() + 1);
             rels.push((id.clone(), format!("media/{name}"), false));
-            // 5cm wide, 3.75cm tall in EMUs (914400 per inch) — a placeholder aspect that keeps
-            // the picture visible; the real dimensions are not recoverable from our HTML.
+            // The document's own dimensions when it has them; otherwise a modest default that
+            // keeps the picture visible rather than filling the page.
             out.push_str(&format!(
-                r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="1800000" cy="1350000"/><wp:docPr id="{n}" name="Picture {n}"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="{n}" name="{name}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1800000" cy="1350000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#,
+                r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:docPr id="{n}" name="Picture {n}"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="{n}" name="{name}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#,
                 n = rels.len(),
                 name = xml_escape(name),
+                cx = run.image_emu.map(|(w, _)| w).unwrap_or(1_800_000),
+                cy = run.image_emu.map(|(_, h)| h).unwrap_or(1_350_000),
             ));
         }
         return;

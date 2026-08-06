@@ -133,7 +133,16 @@ pub fn parse(html: &str) -> Parsed {
                             let file = src.rsplit('/').next().unwrap_or(src).to_string();
                             if !file.is_empty() && !src.starts_with("data:") {
                                 images.push(file.clone());
-                                runs.push(Run { image: Some(file), ..Run::default() });
+                                // width/height are CSS pixels; OOXML wants EMUs (914400/inch).
+                                let px = |k: &str| attrs.get(k).and_then(|v| v.parse::<f64>().ok());
+                                let emu = match (px("width"), px("height")) {
+                                    (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some((
+                                        (w / 96.0 * 914400.0).round() as i64,
+                                        (h / 96.0 * 914400.0).round() as i64,
+                                    )),
+                                    _ => None,
+                                };
+                                runs.push(Run { image: Some(file), image_emu: emu, ..Run::default() });
                             }
                         }
                     }
@@ -291,6 +300,7 @@ pub fn parse(html: &str) -> Parsed {
                     strike: fmt.strike,
                     link: fmt.link.clone(),
                     image: None,
+                    image_emu: None,
                 });
             }
             Event::Eof => break,

@@ -141,19 +141,28 @@ fn read_entry(
     }
 }
 
-/// The r:id of the DEFAULT header (or footer) reference in the body's sectPr, if any.
+/// The r:id of the header (or footer) part worth showing: the FIRST-page one when the section
+/// has one, else the default.
+///
+/// Which matters more than it sounds. A TAFE assessment form puts its banner, logo and title in
+/// the first-page header (`w:type="first"`, used because the section sets `w:titlePg`) and leaves
+/// the plain document name in the default header. Reading only the default is why our export
+/// showed a bare filename where LibreOffice showed the branding (2026-08-06).
 fn default_part_ref(xml: &[u8], want: &[u8]) -> Option<String> {
     let mut r = Reader::from_reader(xml);
     r.config_mut().trim_text(false);
     let mut buf = Vec::new();
-    let mut found: Option<String> = None;
+    let mut default_id: Option<String> = None;
+    let mut first_id: Option<String> = None;
     loop {
         match r.read_event_into(&mut buf) {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if local_name(e.name().as_ref()) == want
-                    && attr(&e, "type").as_deref() == Some("default")
-                {
-                    found = attr(&e, "id");
+                if local_name(e.name().as_ref()) == want {
+                    match attr(&e, "type").as_deref() {
+                        Some("first") => first_id = attr(&e, "id"),
+                        Some("default") => default_id = attr(&e, "id"),
+                        _ => {}
+                    }
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -161,7 +170,7 @@ fn default_part_ref(xml: &[u8], want: &[u8]) -> Option<String> {
         }
         buf.clear();
     }
-    found
+    first_id.or(default_id)
 }
 
 /// The document's page geometry from the body's `w:sectPr`. Twips (1/1440 inch) throughout;
@@ -669,17 +678,40 @@ impl Parser {
     fn parse_drawing(&mut self, r: &mut Reader<&[u8]>) -> Result<String, String> {
         let mut buf = Vec::new();
         let mut html = String::new();
+        // The picture's real size, in EMUs (914400 per inch). Carried onto the <img> as width and
+        // height ATTRIBUTES — presentational markup, not a style attribute, so the no-inline rule
+        // holds — because a picture exported at a made-up size lands cropped or overflowing
+        // (2026-08-06: the TAFE logo at a placeholder 5cm).
+        let mut extent: Option<(f64, f64)> = None;
         loop {
             match r.read_event_into(&mut buf).map_err(|e| e.to_string())? {
                 Event::Start(e) | Event::Empty(e) => {
+                    if local_name(e.name().as_ref()) == b"extent" {
+                        let cx = attr(&e, "cx").and_then(|v| v.parse::<f64>().ok());
+                        let cy = attr(&e, "cy").and_then(|v| v.parse::<f64>().ok());
+                        if let (Some(cx), Some(cy)) = (cx, cy) {
+                            if cx > 0.0 && cy > 0.0 {
+                                extent = Some((cx, cy));
+                            }
+                        }
+                    }
                     if local_name(e.name().as_ref()) == b"blip" {
                         if let Some(rel) = attr(&e, "embed").and_then(|id| self.rels.get(&id)) {
                             let target = rel.target.trim_start_matches("./").to_string();
                             if let Some(bytes) = self.media.get(&target).cloned() {
                                 let base = target.rsplit('/').next().unwrap_or("image").to_string();
                                 let name = self.unique_asset_name(&base);
+                                let size = extent
+                                    .map(|(cx, cy)| {
+                                        format!(
+                                            " width=\"{}\" height=\"{}\"",
+                                            (cx / 914400.0 * 96.0).round() as i64,
+                                            (cy / 914400.0 * 96.0).round() as i64
+                                        )
+                                    })
+                                    .unwrap_or_default();
                                 html = format!(
-                                    "<img src=\"{}/{}\">",
+                                    "<img src=\"{}/{}\"{size}>",
                                     escape_attr(&self.asset_dir),
                                     escape_attr(&name)
                                 );
@@ -1356,9 +1388,37 @@ mod tests {
         ]);
         let out = docx_to_segments(&d, "pics").unwrap();
         assert_eq!(out.header_html, "<p>TAFE Queensland</p>", "header");
+        // (the default header, since this fixture declares no first-page one)
         assert_eq!(out.footer_html, "<p>Page footer</p>", "footer");
         // The EVEN-page header is not the default one and must not be picked up by mistake.
         assert!(!out.header_html.contains("rX"));
+    }
+
+    #[test]
+    fn the_first_page_header_wins_over_the_default() {
+        // The branding lives in the first-page header on real assessment forms; the default one
+        // holds a bare document name.
+        let rels = concat!(
+            r#"<?xml version="1.0"?><Relationships xmlns="rel">"#,
+            r#"<Relationship Id="rD" Target="header1.xml"/>"#,
+            r#"<Relationship Id="rF1" Target="header3.xml"/>"#,
+            r#"</Relationships>"#
+        );
+        let plain = r#"<?xml version="1.0"?><w:hdr xmlns:w="w"><w:p><w:r><w:t>FILE_NAME</w:t></w:r></w:p></w:hdr>"#;
+        let brand = r#"<?xml version="1.0"?><w:hdr xmlns:w="w"><w:p><w:r><w:t>Assessment Marking Criteria</w:t></w:r></w:p></w:hdr>"#;
+        let body = concat!(
+            r#"<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:titlePg/>"#,
+            r#"<w:headerReference w:type="default" r:id="rD"/>"#,
+            r#"<w:headerReference w:type="first" r:id="rF1"/></w:sectPr>"#
+        );
+        let d = docx(&[
+            ("word/document.xml", &doc(body)),
+            ("word/_rels/document.xml.rels", rels),
+            ("word/header1.xml", plain),
+            ("word/header3.xml", brand),
+        ]);
+        let out = docx_to_segments(&d, "pics").unwrap();
+        assert_eq!(out.header_html, "<p>Assessment Marking Criteria</p>");
     }
 
     #[test]
