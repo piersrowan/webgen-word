@@ -70,6 +70,13 @@ pub struct State {
     pub baseline: String,
     /// This document's style overrides, as last read from or written to it.
     pub custom: CustomStyles,
+    /// A `.docx` conversion's temporary home (Piers, 2026-08-06: looking at a document must not
+    /// litter). Set while the document on screen lives in a convert dir under the cache; deleted
+    /// whole the moment that document is closed, replaced, or SAVED to a real home.
+    pub temp_convert: Option<PathBuf>,
+    /// Where a converted document would naturally live: `stem.html` beside the original `.docx`.
+    /// Save As offers this; nothing is written there until the user says so.
+    pub suggested: Option<PathBuf>,
     /// Style changes that can be taken back, oldest first. Interleaved with WebKit's own text
     /// history by [`undo`], so Undo always reverses the last action whichever kind it was.
     pub undo: Vec<undo::StyleStep>,
@@ -90,6 +97,8 @@ fn doc_title(path: &Option<PathBuf>) -> String {
 }
 
 fn main() -> glib::ExitCode {
+    // A crash cannot clean its own convert dir, so each launch sweeps ancient ones.
+    sweep_stale_converts();
     let app = adw::Application::builder()
         .application_id(APP_ID)
         // Positional file arguments, per CONTRACT.md 5 -- `webgen-word cv.html` and "Open With"
@@ -135,6 +144,8 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         setup: PageSetup::from_settings(settings),
         baseline: String::new(),
         custom: CustomStyles::new(),
+        temp_convert: None,
+        suggested: None,
         undo: Vec::new(),
         redo: Vec::new(),
     }));
@@ -366,6 +377,7 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                     let settings = settings.clone();
                     let say = say.clone();
                     let again = load_self.clone();
+                    let state = state.clone();
                     dlg.connect_response(None, move |dlg, resp| {
                         dlg.close();
                         if resp == "cancel" {
@@ -374,13 +386,24 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                         let mode = ConvertMode::from_key(resp);
                         settings.set_string("docx_convert_mode", mode.key());
                         match convert_docx(&p, mode) {
-                            Ok((doc, pictures)) => {
+                            Ok((doc, tmp_dir, suggested, pictures)) => {
                                 let extra = if pictures > 0 {
                                     format!(" (+{pictures} picture{})", if pictures == 1 { "" } else { "s" })
                                 } else {
                                     String::new()
                                 };
-                                say(&format!("Converted to {}{extra} — editing the HTML copy.", doc.display()));
+                                say(&format!(
+                                    "Converted{extra} — viewing a copy. Save to keep it (suggests {}).",
+                                    suggested.display()
+                                ));
+                                // Any previous conversion this window still owned dies first —
+                                // overwriting the field would leak its dir until the sweep.
+                                drop_temp_convert(&state, None);
+                                {
+                                    let mut s = state.borrow_mut();
+                                    s.temp_convert = Some(tmp_dir);
+                                    s.suggested = Some(suggested);
+                                }
                                 if let Some(f) = again.borrow().as_ref() {
                                     f(Some(doc));
                                 }
@@ -393,6 +416,11 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                 }
                 other => other,
             };
+            // The document being replaced may have been a docx conversion living in a temp dir —
+            // if what loads next is not from that same dir, the dir and everything in it goes.
+            // (The docx arm above returned early, so a CANCELLED convert dialog never lands here
+            // and cannot delete the document still on screen.)
+            drop_temp_convert(&state, path.as_deref());
             let bytes = path.as_ref().map(|p| (p.clone(), std::fs::read(p)));
 
             let (html, setup, path, report) = match bytes {
@@ -654,6 +682,8 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                     s.baseline = html;
                     s.path = Some(path.clone());
                     drop(s);
+                    // A converted document just got a real home — its temp preview dir is done.
+                    drop_temp_convert(&state, Some(&path));
 
                     if let Some(summary) = report.summary() {
                         say(&summary);
@@ -694,7 +724,12 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             filter.add_pattern("*.htm");
             let list = gtk::gio::ListStore::new::<gtk::FileFilter>();
             list.append(&filter);
-            let current = state.borrow().path.clone();
+            // A docx conversion suggests its natural home — stem.html beside the original —
+            // rather than the temp dir it is previewing from.
+            let current = {
+                let s = state.borrow();
+                if s.temp_convert.is_some() { s.suggested.clone() } else { s.path.clone() }
+            };
             let d = gtk::FileDialog::builder()
                 .title("Save document")
                 .initial_name(current.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "document.html".into()))
@@ -721,11 +756,15 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         Rc::new(move || {
             // Read the path out and let the borrow go before saving: holding a RefCell borrow across
             // a call that may re-enter it is a panic waiting for someone to make the callback
-            // synchronous.
-            let path = state.borrow().path.clone();
+            // synchronous. A docx preview's "path" is its TEMP home — plain Save must ask where
+            // the document really lives, not quietly write into a dir that dies on close.
+            let (path, previewing) = {
+                let s = state.borrow();
+                (s.path.clone(), s.temp_convert.is_some())
+            };
             match path {
-                Some(p) => save_to(p, false),
-                None => save_as(),
+                Some(p) if !previewing => save_to(p, false),
+                _ => save_as(),
             }
         })
     };
@@ -740,6 +779,8 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let window = window.clone();
         let view = view.clone();
         let state = state.clone();
+        let app = app.clone();
+        let settings = settings.clone();
         open_b.connect_clicked(move |_| {
             let filter = gtk::FileFilter::new();
             filter.set_name(Some("Documents (HTML, Word)"));
@@ -751,14 +792,41 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
             let d = gtk::FileDialog::builder().title("Open document").filters(&list).build();
             let load_into = load_into.clone();
             let window2 = window.clone();
-            // Opening replaces what is on screen, so it asks the same question Close does.
-            confirm_if_modified(&window, &view, &state, move || {
+            let view = view.clone();
+            let state = state.clone();
+            let app = app.clone();
+            let settings = settings.clone();
+            d.open(Some(&window2), gtk::gio::Cancellable::NONE, move |res| {
+                let Ok(f) = res else { return };
+                let Some(picked) = f.path() else { return };
+                // One document, one window (Piers, 2026-08-06; labwc is the tab strip). Only a
+                // PRISTINE blank — never saved, never typed in — is reused; anything else keeps
+                // its window and the new document gets its own. That also retires the "opening
+                // replaces your work behind a confirm" gesture: nothing is replaced any more.
+                let state = state.clone();
                 let load_into = load_into.clone();
-                d.open(Some(&window2), gtk::gio::Cancellable::NONE, move |res| {
-                    if let Ok(f) = res {
-                        load_into(f.path());
-                    }
-                });
+                let app = app.clone();
+                let settings = settings.clone();
+                view.evaluate_javascript(
+                    "document.documentElement.outerHTML",
+                    None,
+                    None,
+                    gtk::gio::Cancellable::NONE,
+                    move |current| {
+                        let current = current.map(|v| v.to_str().to_string()).unwrap_or_default();
+                        let pristine = {
+                            let s = state.borrow();
+                            s.path.is_none()
+                                && s.temp_convert.is_none()
+                                && (s.baseline.is_empty() || current == s.baseline)
+                        };
+                        if pristine {
+                            load_into(Some(picked));
+                        } else {
+                            build(&app, &settings, Some(picked));
+                        }
+                    },
+                );
             });
         });
     }
@@ -956,10 +1024,17 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         let state = state.clone();
         window.connect_close_request(move |w| {
             if state.borrow().baseline.is_empty() {
+                drop_temp_convert(&state, None);
                 return glib::Propagation::Proceed;
             }
             let w2 = w.clone();
-            confirm_if_modified(w, &view, &state, move || w2.destroy());
+            let state2 = state.clone();
+            confirm_if_modified(w, &view, &state, move || {
+                // Closing a docx preview — changed or not — takes its temp dir with it. What was
+                // worth keeping was saved (which already cleaned up); the rest is litter.
+                drop_temp_convert(&state2, None);
+                w2.destroy()
+            });
             glib::Propagation::Stop
         });
     }
@@ -1093,10 +1168,27 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     // CAPTURE phase, so these beat the WebView. Only bindings WebKit does NOT already provide are
     // added: it handles Ctrl+B/I/U, Ctrl+Z/Y and the clipboard itself, and binding those again here
     // would fire the command twice and un-toggle it.
+    // View-only zoom (Piers, 2026-08-06). WebKit's own zoom level: the document scales, the file
+    // and the print/PDF path are untouched. Clamped so a stray key cannot zoom the page away.
+    let zoom = {
+        let view = view.clone();
+        let say = say.clone();
+        Rc::new(move |step: f64| {
+            let z = if step == 0.0 {
+                1.0
+            } else {
+                (view.zoom_level() + step).clamp(0.5, 3.0)
+            };
+            view.set_zoom_level(z);
+            say(&format!("Zoom {:.0}%", z * 100.0));
+        })
+    };
+
     {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         let view_k = view.clone();
+        let zoom = zoom.clone();
         let new_click = new_b.clone();
         let open_click = open_b.clone();
         let print = print.clone();
@@ -1125,6 +1217,10 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
                 (true, false, Key::p) => print(),
                 (true, false, Key::w) => close_document(),
                 (true, false, Key::k) => link_click.emit_clicked(),
+                // Ctrl+= is what the unshifted plus key actually sends; both are accepted.
+                (true, _, Key::plus | Key::equal | Key::KP_Add) => zoom(0.1),
+                (true, false, Key::minus | Key::KP_Subtract) => zoom(-0.1),
+                (true, false, Key::_0 | Key::KP_0) => zoom(0.0),
                 (true, _, Key::Return | Key::KP_Enter) => brk_click.emit_clicked(),
                 // Tab indents, Shift+Tab outdents. In a list this is how a sub-list is made, which
                 // is the behaviour every word processor has and the reason Tab does not insert a
@@ -1462,27 +1558,75 @@ fn native_table(t: &webgen_convert::DocTable, id: u32, mode: ConvertMode) -> Opt
     Some(table::Table { id, head, body: rows, foot: Vec::new(), css })
 }
 
-/// Convert a `.docx` into `stem.html` + `stem_files/` beside it and hand back the html to open.
+/// Delete a docx conversion's temporary home, unless `keep_if_under` still points into it.
+/// Called whenever the document it held stops being what is on screen: closed, replaced, or
+/// saved to a real home. Looking at a document must not litter (Piers, 2026-08-06).
+fn drop_temp_convert(state: &Rc<RefCell<State>>, keep_if_under: Option<&Path>) {
+    let dir = state.borrow().temp_convert.clone();
+    let Some(dir) = dir else { return };
+    if let Some(k) = keep_if_under {
+        if k.starts_with(&dir) {
+            return;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut s = state.borrow_mut();
+    s.temp_convert = None;
+    s.suggested = None;
+}
+
+/// Remove convert dirs a crashed session left behind. Anything older than two days cannot be on
+/// anyone's screen; a live one belongs to another running window and is younger than that.
+fn sweep_stale_converts() {
+    let base = gtk::glib::user_cache_dir().join("webgen-word");
+    let Ok(entries) = std::fs::read_dir(&base) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        if !name.to_string_lossy().starts_with("convert-") {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age.as_secs() > 2 * 24 * 3600)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Convert a `.docx` into html-plus-folder in a fresh TEMP dir and hand back the html to open,
+/// its temp home, and the natural save target (`stem.html` beside the original).
 ///
-/// Same shape as the `.wgz` unpack above and for the same reason: the working form is markup plus
-/// a folder, so a foreign format's job is to BECOME that form, once, next to itself — after which
-/// the ordinary open path (sanitiser included) treats it like any HTML it does not trust yet.
+/// Temp, not beside the original: conversion is a PREVIEW until the user saves. [Save] copies the
+/// document (pictures included — `save_to` relocates them) to wherever the user says, and the
+/// temp home is deleted; closing without saving deletes every trace. The ordinary open path
+/// (sanitiser included) treats the temp html like any HTML it does not trust yet.
 /// Tables whose cells are simple become NATIVE table blocks (editable in the table window, styled
 /// through the CSS panel); the rest keep semantic markup with the same scoped-sheet conventions.
-/// Returns the html path and how many pictures were extracted.
-fn convert_docx(archive: &Path, mode: ConvertMode) -> Result<(PathBuf, usize), String> {
+fn convert_docx(
+    archive: &Path,
+    mode: ConvertMode,
+) -> Result<(PathBuf, PathBuf, PathBuf, usize), String> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
     let bytes = std::fs::read(archive).map_err(|e| e.to_string())?;
     let stem = archive
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "document".into());
-    // Never clobber: converting a second time makes stem-1.html, not a surprise overwrite.
-    let mut target = archive.with_file_name(format!("{stem}.html"));
-    let mut n = 0;
-    while target.exists() {
-        n += 1;
-        target = archive.with_file_name(format!("{stem}-{n}.html"));
-    }
+    let tmp_dir = gtk::glib::user_cache_dir().join("webgen-word").join(format!(
+        "convert-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+    let target = tmp_dir.join(format!("{stem}.html"));
+    let suggested = archive.with_file_name(format!("{stem}.html"));
     let folder = assets::folder_name(&target);
     let out = webgen_convert::docx_to_segments(&bytes, &folder).map_err(|e| e.to_string())?;
 
@@ -1531,7 +1675,7 @@ fn convert_docx(archive: &Path, mode: ConvertMode) -> Result<(PathBuf, usize), S
         body
     );
     std::fs::write(&target, html).map_err(|e| e.to_string())?;
-    Ok((target, out.assets.len()))
+    Ok((target, tmp_dir, suggested, out.assets.len()))
 }
 
 /// Ask for a path with one filter, then hand it back.
