@@ -1269,6 +1269,32 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
     // The two one-file forms. Both are "save a copy": neither changes what the document is, so
     // neither takes over the title bar or the modified state.
     // --- pages: the marker gate's controls + the whole-document PDF reader --------------------
+    // --- table: structural edits where the caret is ------------------------------------------
+    // In the document, not in the table window (Piers, 2026-08-06). The window stays for whole-
+    // table work; these are the edits you reach for mid-sentence.
+    let table_section = gtk::gio::Menu::new();
+    for (label, name, op) in [
+        ("Insert row above", "tbl-row-above", TableOp::RowAbove),
+        ("Insert row below", "tbl-row-below", TableOp::RowBelow),
+        ("Delete row", "tbl-row-del", TableOp::DeleteRow),
+        ("Insert column left", "tbl-col-left", TableOp::ColumnLeft),
+        ("Insert column right", "tbl-col-right", TableOp::ColumnRight),
+        ("Delete column", "tbl-col-del", TableOp::DeleteColumn),
+        ("Merge with cell right", "tbl-merge-right", TableOp::MergeRight),
+        ("Merge with cell below", "tbl-merge-down", TableOp::MergeDown),
+        ("Split merged cell", "tbl-split", TableOp::SplitCell),
+    ] {
+        table_section.append(
+            Some(label),
+            Some(&action(&window, name, {
+                let view = view.clone();
+                let say = say.clone();
+                move || table_op(&view, &say, op)
+            })),
+        );
+    }
+    menu.append_submenu(Some("Table"), &table_section);
+
     let pages_section = gtk::gio::Menu::new();
     pages_section.append(Some("Allow this page to run long"), Some(&action(&window, "page-slack", {
         let view = view.clone();
@@ -1546,6 +1572,131 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
 /// Saving an existing table replaces everything between its boundary markers; saving a new one puts
 /// a block in at the caret. Deleting takes the block out. In every case the markup is *generated*
 /// from the model rather than patched, which is what keeps the document and the JSON in step.
+/// The structural table edits offered in the document itself.
+#[derive(Clone, Copy, PartialEq)]
+enum TableOp {
+    RowAbove,
+    RowBelow,
+    DeleteRow,
+    ColumnLeft,
+    ColumnRight,
+    DeleteColumn,
+    MergeRight,
+    MergeDown,
+    SplitCell,
+}
+
+/// Apply a structural edit to the table the CARET is in (Piers, 2026-08-06: in the document, not
+/// in the table window). The model is the truth: the block is regenerated from it, so the JSON,
+/// the markup and the scoped CSS cannot drift apart. Nothing happens — with a reason in the
+/// status line — when the caret is not in a table.
+fn table_op(view: &webkit6::WebView, say: &Rc<impl Fn(&str) + 'static>, op: TableOp) {
+    let view2 = view.clone();
+    let say = say.clone();
+    view.evaluate_javascript(
+        &table::find_cell_at_cursor_script(),
+        None,
+        None,
+        gtk::gio::Cancellable::NONE,
+        move |res| {
+            let found = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+            let mut parts = found.splitn(4, '|');
+            let (Some(section), Some(row), Some(index), Some(json)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                say("Put the cursor in a table first.");
+                return;
+            };
+            let (row, index) = (
+                row.parse::<usize>().unwrap_or(0),
+                index.parse::<usize>().unwrap_or(0),
+            );
+            let Some(mut table) = table::Table::from_json(&table::unescape_attr(json)) else {
+                say("That table's data could not be read — nothing was changed.");
+                return;
+            };
+
+            // Row operations act on the body: a header row is the table's shape, not a row you
+            // add another of by accident. A caret in the header means "the top of the body".
+            let in_body = section == "body";
+            let body_row = if in_body { row } else { 0 };
+            // The caret's GRID column, which is what column operations and merges are indexed
+            // by: a row carrying spans has fewer cells than the table has columns.
+            let grid = table::Grid::of(match section {
+                "head" => &table.head,
+                "foot" => &table.foot,
+                _ => &table.body,
+            });
+            let placed = grid.cells.iter().find(|c| c.row == row && c.index == index);
+            let col = placed.map(|c| c.col).unwrap_or(0);
+            let span = placed.map(|c| c.colspan).unwrap_or(1);
+
+            let done = match op {
+                TableOp::RowAbove => {
+                    table.insert_row(body_row);
+                    "Row added."
+                }
+                TableOp::RowBelow => {
+                    table.insert_row(if in_body { body_row + 1 } else { 0 });
+                    "Row added."
+                }
+                TableOp::DeleteRow => {
+                    if !in_body {
+                        say("A header row cannot be deleted from here — use the table window.");
+                        return;
+                    }
+                    table.delete_row(body_row);
+                    "Row deleted."
+                }
+                TableOp::ColumnLeft => {
+                    table.insert_column(col);
+                    "Column added."
+                }
+                TableOp::ColumnRight => {
+                    table.insert_column(col + span);
+                    "Column added."
+                }
+                TableOp::DeleteColumn => {
+                    table.delete_column(col);
+                    "Column deleted."
+                }
+                TableOp::MergeRight => {
+                    if !in_body || !table.merge(body_row, col, body_row, col + span) {
+                        say("Those cells cannot be merged.");
+                        return;
+                    }
+                    "Cells merged."
+                }
+                TableOp::MergeDown => {
+                    if !in_body || !table.merge(body_row, col, body_row + 1, col) {
+                        say("Those cells cannot be merged.");
+                        return;
+                    }
+                    "Cells merged."
+                }
+                TableOp::SplitCell => {
+                    if !in_body || !table.split(body_row, col) {
+                        say("That cell is not merged.");
+                        return;
+                    }
+                    "Cell split."
+                }
+            };
+
+            let script = table::replace_block_script(&table.class(), &table.to_block());
+            let say2 = say.clone();
+            view2.evaluate_javascript(&script, None, None, gtk::gio::Cancellable::NONE, move |r| {
+                let ok = r.map(|v| v.to_str().to_string()).unwrap_or_default();
+                if ok.is_empty() {
+                    say2("The table could not be updated — nothing was changed.");
+                } else {
+                    say2(done);
+                }
+            });
+        },
+    );
+}
+
 fn apply_table(
     view: &webkit6::WebView,
     say: &Rc<impl Fn(&str) + 'static>,

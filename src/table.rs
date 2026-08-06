@@ -476,6 +476,39 @@ pub fn find_at_cursor_script() -> String {
     )
 }
 
+/// The table AND the cell the caret sits in: `"section|row|index|json"`, empty when the caret is
+/// not in a table. `section` is `head`/`body`/`foot`, `row` is the row's index within that
+/// section and `index` its position in that row's array — the same coordinates the model uses,
+/// because the renderer emits cells in model order.
+///
+/// This is what makes table editing happen IN the document (Piers, 2026-08-06) rather than in the
+/// table window: the caret is the selection, so no dialog has to be opened to say where.
+pub fn find_cell_at_cursor_script() -> String {
+    format!(
+        "(function () {{
+           const sel = window.getSelection();
+           let node = sel && sel.anchorNode;
+           if (!node && document.activeElement) node = document.activeElement;
+           let el = node ? (node.nodeType === 1 ? node : node.parentElement) : null;
+           let cell = el;
+           while (cell && cell.tagName !== 'TD' && cell.tagName !== 'TH') cell = cell.parentElement;
+           let table = cell || el;
+           while (table && table.tagName !== 'TABLE') table = table.parentElement;
+           if (!table || !table.hasAttribute('{attr}')) return '';
+           const json = table.getAttribute('{attr}');
+           if (!cell) return 'body|0|0|' + json;
+           const tr = cell.parentElement;
+           const sectionTag = tr.parentElement ? tr.parentElement.tagName : 'TBODY';
+           const section = sectionTag === 'THEAD' ? 'head' : (sectionTag === 'TFOOT' ? 'foot' : 'body');
+           const rows = Array.prototype.slice.call(tr.parentElement.children);
+           const row = rows.indexOf(tr);
+           const index = Array.prototype.slice.call(tr.children).indexOf(cell);
+           return section + '|' + row + '|' + index + '|' + json;
+         }})()",
+        attr = DATA_ATTR,
+    )
+}
+
 /// The highest `wg-tN` already in the document, so a new table cannot collide with one whose block
 /// was deleted and re-added.
 pub fn highest_id_script() -> String {

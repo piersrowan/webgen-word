@@ -54,14 +54,23 @@ pub fn check_script(page_px: f64) -> String {
         if (el.offsetHeight === 0) continue; /* hidden or empty: never a reason to break */
         var bottom = el.offsetTop + el.offsetHeight;
         var limit = PAGE * (slack ? 1.10 : 0.94);
-        /* Never break with nothing on the page yet: a document whose FIRST block is taller than
-           the window (an assessment form opening on a big table) would otherwise get a break at
-           position zero and print a blank first page (2026-08-06). A block with no room above it
-           starts where it starts and overflows. */
+        /* A block TALLER than a page cannot be made to fit by breaking before it, and printing
+           does split tables across pages (Piers, 2026-08-06: "let print split tables"). So it
+           flows from wherever it starts, spans as many sheets as it needs, and the next block
+           measures against the last of them — which is what stops a 1.2-page table from
+           costing two whole pages and is why LibreOffice fitted the same form in fewer. */
+        if (el.offsetHeight > limit) {{
+            var spanned = Math.max(1, Math.ceil((bottom - pageTop) / PAGE));
+            pageTop = pageTop + (spanned - 1) * PAGE;
+            pages += spanned - 1;
+            slack = false;
+            placed = 1; /* its tail sits on the current page: something IS placed here */
+            continue;
+        }}
+        /* Never break with nothing on the page yet: a break at position zero prints a blank
+           first page (2026-08-06). */
         if (placed === 0) {{
             placed++;
-            if (el.offsetHeight > limit) {{ pageTop = bottom; slack = false; placed = 0;
-                pages += Math.max(0, Math.ceil(el.offsetHeight / PAGE) - 1); }}
             continue;
         }}
         placed++;
@@ -79,17 +88,6 @@ pub fn check_script(page_px: f64) -> String {
                 inserted++;
                 pages++;
             }}
-        }}
-        /* A block taller than the page owns its page(s) and overflows honestly: the next
-           measurement starts BELOW it, or everything after it would break one line each. The
-           count must own them too — a table spanning three sheets IS three pages, and growing
-           it should move the number even though no marker can land inside a block (2026-08-06:
-           "new lines inside a table didn't count"). */
-        if (el.offsetHeight > limit) {{
-            pageTop = bottom;
-            slack = false;
-            placed = 0;
-            pages += Math.max(0, Math.ceil(el.offsetHeight / PAGE) - 1);
         }}
     }}
     return inserted + "," + pages;
