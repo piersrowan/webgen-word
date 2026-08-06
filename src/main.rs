@@ -1969,6 +1969,9 @@ fn native_table(t: &webgen_convert::DocTable, id: u32, mode: ConvertMode) -> Opt
     if rows.is_empty() {
         return None;
     }
+    // The document's own column widths, adopted whole. Plain mode drops them: "no formatting"
+    // means the page decides, not the source.
+    let cols = if mode == ConvertMode::Plain { Vec::new() } else { t.col_widths_mm.clone() };
     let head = vec![rows.remove(0)];
     let mut css = std::collections::BTreeMap::new();
     let bordered = match mode {
@@ -1988,7 +1991,7 @@ fn native_table(t: &webgen_convert::DocTable, id: u32, mode: ConvertMode) -> Opt
         css.insert("th".to_string(), crate::docstyle::TagStyle { font_weight: "bold".into(), ..cell.clone() });
         css.insert("td".to_string(), cell);
     }
-    Some(table::Table { id, head, body: rows, foot: Vec::new(), css })
+    Some(table::Table { id, head, body: rows, foot: Vec::new(), cols, css })
 }
 
 /// Delete a docx conversion's temporary home, unless `keep_if_under` still points into it.

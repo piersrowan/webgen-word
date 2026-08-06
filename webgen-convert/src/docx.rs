@@ -663,6 +663,8 @@ impl Parser {
         let mut rows: Vec<Vec<Raw>> = Vec::new();
         let mut bordered = false;
         let mut in_tbl_borders = false;
+        let mut in_grid = false;
+        let mut col_widths_mm: Vec<f64> = Vec::new();
         let mut buf = Vec::new();
         loop {
             let ev = r.read_event_into(&mut buf).map_err(|e| e.to_string())?;
@@ -686,6 +688,14 @@ impl Parser {
                         // also exist per-cell in tcBorders, but those are consumed inside
                         // parse_cell and never reach this loop.
                         b"tblBorders" => in_tbl_borders = is_start,
+                        // The column grid: one gridCol per column, width in twips. Nested tables
+                        // parse their own inside parse_cell, so this only ever sees its own.
+                        b"tblGrid" => in_grid = is_start,
+                        b"gridCol" if in_grid => {
+                            if let Some(w) = attr(e, "w").and_then(|v| v.parse::<f64>().ok()) {
+                                col_widths_mm.push(w / 1440.0 * 25.4);
+                            }
+                        }
                         b"top" | b"bottom" | b"left" | b"right" | b"insideH" | b"insideV"
                             if in_tbl_borders =>
                         {
@@ -700,6 +710,7 @@ impl Parser {
                 Event::End(e) => match local_name(e.name().as_ref()) {
                     b"tbl" => break,
                     b"tblBorders" => in_tbl_borders = false,
+                    b"tblGrid" => in_grid = false,
                     _ => {}
                 },
                 Event::Eof => break,
@@ -743,7 +754,7 @@ impl Parser {
             .collect();
 
         self.table_seq += 1;
-        Ok(DocTable { seq: self.table_seq, rows, bordered })
+        Ok(DocTable { seq: self.table_seq, rows, bordered, col_widths_mm })
     }
 
     /// One `<w:tc>` … `</w:tc>`: harvest the props (gridSpan/vMerge/shd live inside `<w:tcPr>`,
@@ -969,6 +980,13 @@ pub fn render_table_html(t: &DocTable) -> String {
     }
 
     let mut css = format!("table.{class} {{ border-collapse: collapse; }}\n");
+    let total: f64 = t.col_widths_mm.iter().sum();
+    if total > 0.0 {
+        css.push_str(&format!("table.{class} {{ table-layout: fixed; width: {total:.1}mm; }}\n"));
+        for (i, w) in t.col_widths_mm.iter().enumerate() {
+            css.push_str(&format!(".{class} col.wg-c{} {{ width: {w:.1}mm; }}\n", i + 1));
+        }
+    }
     if t.bordered {
         css.push_str(&format!(
             "table.{class}, .{class} th, .{class} td {{ border: 1px solid #000000; }}\n"
@@ -985,6 +1003,13 @@ pub fn render_table_html(t: &DocTable) -> String {
     }
 
     let mut html = format!("<style>\n{css}</style>\n<table class=\"{class}\">");
+    if total > 0.0 {
+        html.push_str("<colgroup>");
+        for i in 0..t.col_widths_mm.len() {
+            html.push_str(&format!("<col class=\"wg-c{}\">", i + 1));
+        }
+        html.push_str("</colgroup>");
+    }
     for (ri, row) in t.rows.iter().enumerate() {
         html.push_str("<tr>");
         for (ci, cell) in row.iter().enumerate() {

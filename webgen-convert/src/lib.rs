@@ -32,6 +32,10 @@ pub struct DocTable {
     pub rows: Vec<Vec<DocCell>>,
     /// The source declared visible borders (docx `tblBorders` with any non-nil edge).
     pub bordered: bool,
+    /// Column widths in millimetres from `w:tblGrid`, one per grid column. Empty when the
+    /// document states none. These are what stop a converted form re-wrapping its cells and
+    /// drifting down the page (Piers, 2026-08-06).
+    pub col_widths_mm: Vec<f64>,
 }
 
 /// What [`docx_to_segments`] produces.

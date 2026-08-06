@@ -128,7 +128,7 @@ impl Cell {
 }
 
 /// A whole table: its headings, its data, and its own stylesheet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Table {
     /// Which `wg-tN` this is, so its CSS can be scoped to it.
     pub id: u32,
@@ -139,6 +139,15 @@ pub struct Table {
     pub body: Vec<Vec<Cell>>,
     #[serde(default)]
     pub foot: Vec<Vec<Cell>>,
+    /// Column widths in millimetres, one per grid column, empty when the table has no opinion.
+    ///
+    /// Imported documents DO have an opinion — `w:tblGrid` states every column's width — and
+    /// discarding it was why a converted form wrapped "Student Name" onto two lines where Word
+    /// and LibreOffice fit it on one, which then compounded down the page (Piers, 2026-08-06).
+    /// Rendered as a `<colgroup>` plus scoped rules, never inline styles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cols: Vec<f64>,
+
     /// selector (as written in [`SELECTORS`]) → its style.
     ///
     /// The same [`TagStyle`] the document style sidebar uses, so there is one style vocabulary in
@@ -164,7 +173,7 @@ impl Table {
         };
         css.insert("th".to_string(), TagStyle { font_weight: "bold".into(), ..cell.clone() });
         css.insert("td".to_string(), cell);
-        Table { id, head, body, foot: Vec::new(), css }
+        Table { id, head, body, foot: Vec::new(), cols: Vec::new(), css }
     }
 
     pub fn class(&self) -> String {
@@ -280,6 +289,22 @@ impl Table {
                 .join(" ");
             out.push_str(&format!("{} {{ {body} }}\n", scope(selector, &class)));
         }
+        // Column widths, and the layout mode that makes them authoritative. `table-layout: fixed`
+        // is the difference between "a hint the browser may ignore when text is long" and "the
+        // width Word said" — without it a long word silently widens its column and every other
+        // column pays, which is exactly the compounding drift converted forms suffered.
+        if !self.cols.is_empty() {
+            let total: f64 = self.cols.iter().sum();
+            if total > 0.0 {
+                out.push_str(&format!(
+                    "table.{class} {{ table-layout: fixed; width: {total:.1}mm; }}\n"
+                ));
+                for (i, w) in self.cols.iter().enumerate() {
+                    out.push_str(&format!(".{class} col.wg-c{} {{ width: {w:.1}mm; }}\n", i + 1));
+                }
+            }
+        }
+
         // Per-cell fills, as `.cell_rN_cM` rules — the deviation list. Sheet rules, never inline:
         // the point is that reading this block tells you exactly which cells differ and how.
         let positions = self.cell_positions();
@@ -356,6 +381,15 @@ impl Table {
             self.class(),
             escape_attr(&self.to_json())
         ));
+        // Column widths as a colgroup: the <col> elements carry only classes, the widths live in
+        // the scoped style block with everything else.
+        if !self.cols.is_empty() {
+            out.push_str("  <colgroup>\n");
+            for i in 0..self.cols.len() {
+                out.push_str(&format!("    <col class=\"wg-c{}\">\n", i + 1));
+            }
+            out.push_str("  </colgroup>\n");
+        }
         let positions = self.cell_positions();
         render_section(&mut out, "thead", "th", &self.head, &positions[0]);
         render_section(&mut out, "tbody", "td", &self.body, &positions[1]);
@@ -419,7 +453,7 @@ fn render_section(
             if !classes.is_empty() {
                 attrs.push_str(&format!(" class=\"{}\"", classes.join(" ")));
             }
-            let mut text = escape(&cell.text);
+            let mut text = escape_cell(&cell.text);
             if text.is_empty() {
                 text.push_str("<br>");
             }
@@ -439,6 +473,35 @@ fn render_section(
         out.push_str("    </tr>\n");
     }
     out.push_str(&format!("  </{section}>\n"));
+}
+
+/// Escape cell text and keep runs of spaces visible — the same rule the docx converter applies,
+/// and it must live here too because a table adopted into the MODEL renders through this path,
+/// not through the converter's markup (2026-08-06: the pen-fill date fields still collapsed).
+pub fn escape_cell(s: &str) -> String {
+    let escaped = escape(s);
+    let chars: Vec<char> = escaped.chars().collect();
+    let mut out = String::with_capacity(escaped.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ' ' {
+            let start = i;
+            while i < chars.len() && chars[i] == ' ' {
+                i += 1;
+            }
+            let run = i - start;
+            if run >= 2 {
+                for _ in 0..run - 1 {
+                    out.push_str("&nbsp;");
+                }
+            }
+            out.push(' ');
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 pub fn escape(s: &str) -> String {
