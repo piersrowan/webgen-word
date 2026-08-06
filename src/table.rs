@@ -86,6 +86,13 @@ pub struct Cell {
     /// `left` | `center` | `right` — empty means "whatever the CSS says".
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub align: String,
+    /// A calculation, without its leading `=`: `$pay_rate * $$superannuation_rate`.
+    ///
+    /// The formula is the truth and the text is its RESULT — recalculating rewrites `text` and
+    /// never touches this. A document opened anywhere else still shows the numbers, because they
+    /// are in the markup as text (Piers's rule, HYBRID.md: correct with JavaScript off).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub formula: String,
     /// Background fill as a CSS colour (`#d9d9d9`), empty for none.
     ///
     /// Rendered as a `.cell_rN_cM` class on the cell plus a matching rule in the scoped style
@@ -117,6 +124,7 @@ impl Default for Cell {
             underline: false,
             align: String::new(),
             fill: String::new(),
+            formula: String::new(),
         }
     }
 }
@@ -567,6 +575,21 @@ pub fn find_cell_at_cursor_script() -> String {
            const row = rows.indexOf(tr);
            const index = Array.prototype.slice.call(tr.children).indexOf(cell);
            return section + '|' + row + '|' + index + '|' + json;
+         }})()",
+        attr = DATA_ATTR,
+    )
+}
+
+/// Every table's model in the document, newline-separated JSON — what Recalculate reads so it can
+/// gather constants from the rates table and results into the sheets that use them.
+pub fn all_tables_script() -> String {
+    format!(
+        "(function () {{
+           const out = [];
+           document.querySelectorAll('table[{attr}]').forEach(function (t) {{
+             out.push(t.getAttribute('{attr}'));
+           }});
+           return out.join('\\n');
          }})()",
         attr = DATA_ATTR,
     )

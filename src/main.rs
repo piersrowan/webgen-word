@@ -38,6 +38,7 @@ mod js;
 mod page;
 mod paged;
 mod paginate;
+mod recalc;
 mod sanitise;
 mod settings;
 mod sidebar;
@@ -1292,6 +1293,89 @@ fn build(app: &adw::Application, settings: &Rc<Settings>, open: Option<PathBuf>)
         );
     }
     menu.append_submenu(Some("Table"), &table_section);
+
+    // --- calculations -------------------------------------------------------------------------
+    let calc_section = gtk::gio::Menu::new();
+    calc_section.append(Some("Recalculate"), Some(&action(&window, "recalculate", {
+        let view = view.clone();
+        let say = say.clone();
+        move || {
+            let view2 = view.clone();
+            let say = say.clone();
+            view.evaluate_javascript(
+                &table::all_tables_script(),
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    let blob = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+                    let tables: Vec<table::Table> = blob
+                        .lines()
+                        .filter_map(|j| table::Table::from_json(&table::unescape_attr(j)))
+                        .collect();
+                    if tables.is_empty() {
+                        say("No tables to calculate.");
+                        return;
+                    }
+                    // Constants come from the tables WITHOUT formulas — the rates live in their
+                    // own little table, which is exactly Piers's out-of-band $$ reference.
+                    let plain: Vec<table::Table> =
+                        tables.iter().filter(|t| !recalc::has_formulas(t)).cloned().collect();
+                    let constants = recalc::constants_from(&plain);
+                    let mut changed = 0;
+                    let mut done = 0;
+                    for mut t in tables.into_iter().filter(|t| recalc::has_formulas(t)) {
+                        let n = recalc::recalculate(&mut t, &constants);
+                        if n > 0 {
+                            changed += n;
+                            done += 1;
+                            view2.evaluate_javascript(
+                                &table::replace_block_script(&t.class(), &t.to_block()),
+                                None,
+                                None,
+                                gtk::gio::Cancellable::NONE,
+                                |_| {},
+                            );
+                        }
+                    }
+                    if done == 0 {
+                        say("Nothing to recalculate — no table carries a formula.");
+                    } else {
+                        say(&format!(
+                            "Recalculated {done} table(s): {changed} value(s), {} constant(s).",
+                            constants.len()
+                        ));
+                    }
+                },
+            );
+        }
+    })));
+    calc_section.append(Some("Insert payroll example"), Some(&action(&window, "calc-example", {
+        let view = view.clone();
+        let say = say.clone();
+        move || {
+            let (rates, mut pay) = recalc::payroll_example(900);
+            let constants = recalc::constants_from(std::slice::from_ref(&rates));
+            recalc::recalculate(&mut pay, &constants);
+            let html = format!("{}{}", rates.to_block(), pay.to_block());
+            let say = say.clone();
+            view.evaluate_javascript(
+                &table::insert_block_script(&html),
+                None,
+                None,
+                gtk::gio::Cancellable::NONE,
+                move |res| {
+                    let ok = res.map(|v| v.to_str().to_string()).unwrap_or_default();
+                    if ok.is_empty() {
+                        say("The example could not be inserted.");
+                    } else {
+                        say("Payroll example inserted — edit a rate or an hour, then Recalculate.");
+                    }
+                },
+            );
+        }
+    })));
+    menu.append_section(None, &calc_section);
 
     let pages_section = gtk::gio::Menu::new();
     pages_section.append(Some("Allow this page to run long"), Some(&action(&window, "page-slack", {
