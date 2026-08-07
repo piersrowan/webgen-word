@@ -387,6 +387,27 @@ so older text comes back before the style step does. The end state after undoing
 same; only the middle differs. When WebKit reports it has nothing left, style steps are taken
 regardless, so none is ever stranded.
 
+## Tables can calculate
+
+A table column can carry a **formula**, and every row of that column runs it — the same model
+webgen-sheets uses, because it is the same engine (`webgen-sheet`, a pinned git dependency on the
+**webgen-sheets** repository; it used to live in this tree and moved out, since a sheet is what it
+models).
+
+- **Table ▸ "Formula for this column…"** sets it for the column the caret is in, lists every
+  `$column` and `$$rate` available, leaves the totals row's `SUM` alone, and recalculates on the
+  spot.
+- **Recalculate** runs every table that carries one. `$name` is another column on the same row;
+  `$$name` is a label/value pair from any two-column table in the document — the rates table.
+- **"Insert payroll example"** drops in a worked one to try it on.
+
+Values are written into the document as **text**. A recipient with no WebGen, no JavaScript and no
+calculator still reads the right numbers: the formula is the recipe, the text is the meal.
+
+⚠ Recalculate distinguishes *nothing changed* from *nothing to calculate*. It used to report "no
+table carries a formula" whenever a pass changed nothing — which is what a freshly inserted, already
+correct example does — and that told the reader something false about their own document.
+
 ## Open tasks
 
 [TASKS.md](TASKS.md) is the live list — what is outstanding, what is waiting on a decision, what
