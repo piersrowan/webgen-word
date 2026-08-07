@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "webgen-word"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "gtk4",
  "libadwaita",
