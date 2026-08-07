@@ -942,6 +942,7 @@ dependencies = [
 [[package]]
 name = "webgen-sheet"
 version = "0.1.0"
+source = "git+ssh://git@github.com/piersrowan/webgen-sheets.git?rev=9201bd1d639bde53b086beb5a09b340cf90ee357#9201bd1d639bde53b086beb5a09b340cf90ee357"
 
 [[package]]
 name = "webgen-swatch"

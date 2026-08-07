@@ -1,5 +1,1 @@
 /target
-
-# The calculation engine lives in the webgen-sheets repository; this is a dev-time symlink to a
-# sibling checkout. pkgs/webgen-word/vendor.sh materialises it as a real directory in the tarball.
-/webgen-sheet

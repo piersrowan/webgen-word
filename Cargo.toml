@@ -1,5 +1,5 @@
 [workspace]
-members = ["webgen-convert", "webgen-sheet"]
+members = ["webgen-convert"]
 
 [package]
 name = "webgen-word"
@@ -40,9 +40,12 @@ webgen-swatch = { git = "ssh://git@github.com/piersrowan/webgen-swatch.git", rev
 # $format -> HTML (docx today). An in-repo path dep — unlike webgen-registry above, it lives in
 # THIS tree, so it survives `cargo vendor` with the tree and needs no git pin.
 webgen-convert = { path = "webgen-convert" }
-# The calculation engine (HYBRID.md). Its own crate so the coming webgen-sheets app can use it
-# without Word. NOT named webgen-calc: that repo is the calculator (Piers, 2026-08-07).
-webgen-sheet = { path = "webgen-sheet" }
+# The calculation engine (HYBRID.md). It LIVES in the webgen-sheets repository now, because a sheet
+# is what it models -- a page is the wrong container for a fourteen-column payroll, and this app is
+# the one borrowing it. A git dependency for the same reason as webgen-registry and webgen-swatch
+# above: a path dep outside this tree does not survive `cargo vendor` for the offline OS build.
+# (NOT named webgen-calc: that repo is the calculator. Piers, 2026-08-07.)
+webgen-sheet = { git = "ssh://git@github.com/piersrowan/webgen-sheets.git", rev = "9201bd1d639bde53b086beb5a09b340cf90ee357" }
 
 [profile.release]
 opt-level = 2
